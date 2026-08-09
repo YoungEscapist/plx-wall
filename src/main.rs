@@ -31,6 +31,11 @@ use wayland_client::{
         wl_region::WlRegion,
     },
 };
+// wp_viewporter: «буфер такой-то, а показывай его вот в этом прямоугольнике».
+// Растягивание при этом делает композитор на видеокарте, а не мы на процессоре.
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
@@ -75,7 +80,7 @@ const DEL_FG: u32 = 0xFFDDDDDD;
 enum Вкладка {
     /// Свои обои — то, что было в dwall всегда.
     Мои,
-    /// Статичные картинки с wallhaven.
+    /// Статичные картинки с openverse.
     Картинки,
     /// Живые обои с moewalls.
     Живые,
@@ -126,6 +131,9 @@ enum UiAction {
 /// плавной смены был бы рывок.
 struct Fade {
     from: Vec<u8>,
+    /// Размер снимка. С viewporter буфер равен размеру КАДРА, а не экрана, и у
+    /// новых обоев он свой — снимок приходится подгонять (см. render_wallpaper).
+    dims: (u32, u32),
     start: Option<std::time::Instant>,
     /// Новых обоев ещё нет — они декодируются в фоне. Пока флаг стоит, часы
     /// не идут и смешивать нечего: на экране просто остаётся старый кадр.
@@ -252,7 +260,27 @@ fn cuda_available() -> bool {
 }
 
 /// Запустить ffmpeg на живые обои. `hw` — декодировать видеокартой.
-fn spawn_ffmpeg(path: &str, w: u32, h: u32, fps: u64, hw: bool) -> Option<std::process::Child> {
+/// Размер картинки в видеофайле. Нужен, чтобы не поручать ffmpeg то, что он
+/// делать не должен, — растягивание (см. [`start_anim`]).
+fn размер_видео(path: &str) -> Option<(u32, u32)> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            path,
+        ])
+        .output()
+        .ok()?;
+    let текст = String::from_utf8_lossy(&out.stdout);
+    let (w, h) = текст.trim().split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// `цель` — размер, в который ffmpeg должен ужать кадр; `None` — отдавать как
+/// есть, без фильтра масштабирования.
+fn spawn_ffmpeg(path: &str, цель: Option<(u32, u32)>, fps: u64, hw: bool) -> Option<std::process::Child> {
     let mut args: Vec<String> = vec![
         "-loglevel".into(), "error".into(), "-nostdin".into(),
     ];
@@ -270,7 +298,12 @@ fn spawn_ffmpeg(path: &str, w: u32, h: u32, fps: u64, hw: bool) -> Option<std::p
         // Замер на green-tree (3840×2160@60): 36.9 с CPU на 12 с видео против
         // 27.9 с после переноса fps в начало (−24%).
         "-vf".into(),
-        format!("fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
+        match цель {
+            Some((w, h)) => {
+                format!("fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}")
+            }
+            None => format!("fps={fps}"),
+        },
         // bgra, а не rgba: ровно то, что ждёт wl_shm — попиксельный
         // своп на 2.7 млн пикселей за кадр просто исчезает.
         "-f".into(), "rawvideo".into(), "-pix_fmt".into(), "bgra".into(), "-".into(),
@@ -299,26 +332,52 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
     let (tx, rx) = sync_channel::<(u32, u32, Vec<u8>, u64, bool)>(1);
 
     if is_video(path) {
-        // Кадры просим сразу в размер экрана и в BGRA — масштабировать и
-        // конвертировать на нашей стороне было бы втрое дороже.
+        // Кадры просим в BGRA — конвертировать на нашей стороне дороже.
         // -stream_loop -1 — бесконечный повтор, fps=15 — потолок частоты:
         // обои не стоят 60 к/с процессорного времени.
         //
         // Декодируем видеокартой, когда она есть: 4K@60 h264 — это ~28 с CPU на
         // каждые 12 с видео (замер 05.08.2026, зелёное дерево 3840×2160),
-        // против 5.7 с через NVDEC. Именно этот декодер и держал на машине
-        // Ярика ~200% CPU в фоне при неподвижных обоях.
+        // против 5.7 с через NVDEC.
         const FPS: u64 = 15;
+
+        // Размер, в котором просим кадры. Ужимать большой ролик в ffmpeg —
+        // полезно: меньше и счёта, и данных через трубу. А вот РАСТЯГИВАТЬ там
+        // мелкий ролик — чистая потеря, потому что то же самое кадрирование с
+        // центрированием делает blit_scaled уже на нашей стороне.
+        //
+        // Замер 09.08.2026 на этих обоях (AV1 1280×720 → экран 3840×2160),
+        // 120 кадров: с масштабированием в ffmpeg — 13.4 с CPU и 474 МБ/с
+        // через трубу, без него — 3.8 с и 52 МБ/с. Разница в 3.5 раза, и
+        // ffmpeg на живой машине держал 264% CPU при неподвижной картинке.
+        // Аппаратный декодер тут не помог бы: у Comet Lake нет AV1 вовсе.
+        //
+        // Цена — качество растягивания: blit_scaled берёт ближайшего соседа,
+        // ffmpeg брал бикубик. Ролик мельче экрана станет заметно грубее.
+        let (вых_w, вых_h, цель) = match размер_видео(path) {
+            Some((iw, ih)) if iw > 0 && ih > 0
+                && (w as f64 / iw as f64).max(h as f64 / ih as f64) > 1.0 =>
+            {
+                // Исходник мельче экрана — берём как есть, растянет blit_scaled.
+                (iw, ih, None)
+            }
+            // Исходник крупнее экрана (или ffprobe промолчал) — ужимаем в
+            // ffmpeg, как и раньше.
+            _ => (w, h, Some((w, h))),
+        };
+
         let hw = cuda_available();
         let child = std::sync::Arc::new(std::sync::Mutex::new(Some(
-            spawn_ffmpeg(path, w, h, FPS, hw)?,
+            spawn_ffmpeg(path, цель, FPS, hw)?,
         )));
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (поток_child, поток_stop) = (child.clone(), stop.clone());
         let путь = path.to_string();
         std::thread::spawn(move || {
             use std::io::Read;
-            let кадр = (w as usize) * (h as usize) * 4;
+            // Размер кадра — тот, в котором его отдаёт ffmpeg, а он теперь не
+            // обязан совпадать с экраном (см. выбор `цель` выше).
+            let кадр = (вых_w as usize) * (вых_h as usize) * 4;
             let mut buf = vec![0u8; кадр];
             let mut hw = hw;
             loop {
@@ -339,7 +398,7 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
                     // впустую.
                     let готов = std::mem::replace(&mut buf, vec![0u8; кадр]);
                     // Ошибка отправки = главный цикл выбросил Anim, уходим.
-                    if tx.send((w, h, готов, 1000 / FPS, true)).is_err() {
+                    if tx.send((вых_w, вых_h, готов, 1000 / FPS, true)).is_err() {
                         return;
                     }
                 }
@@ -353,7 +412,7 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
                 if hw && кадров == 0 {
                     hw = false;
                     eprintln!("dwall: аппаратный декодер не справился, повтор программным");
-                    let Some(новый) = spawn_ffmpeg(&путь, w, h, FPS, false) else { return };
+                    let Some(новый) = spawn_ffmpeg(&путь, цель, FPS, false) else { return };
                     match поток_child.lock() {
                         Ok(mut g) => *g = Some(новый),
                         Err(_) => return,
@@ -559,6 +618,16 @@ struct Config {
     ol_slot: usize,
     /// Кадр обоев не удалось отдать (оба буфера ещё у композитора) — повторить.
     bg_pending: bool,
+    /// wp_viewporter, если композитор его предлагает. Нет — работаем как
+    /// раньше, растягивая кадры на процессоре.
+    viewporter: Option<WpViewporter>,
+    /// Viewport фоновой поверхности: им задаётся, какой кусок буфера и в какой
+    /// прямоугольник экрана растянуть.
+    bg_viewport: Option<WpViewport>,
+    /// Пользователь нажал «Поиск»: меню прячем, а строку ввода (fuzzel)
+    /// запускаем из главного цикла — и только после того, как кадр со скрытым
+    /// меню действительно ушёл композитору. См. ветку UiAction::Поиск.
+    запросить_поиск: bool,
     /// Карточка под курсором. Перерисовываем меню только когда она сменилась —
     /// иначе одно движение мыши через меню давало сотню перерисовок.
     hover: Option<usize>,
@@ -663,6 +732,9 @@ fn main() {
         ol_slots: Vec::new(),
         ol_slot: 0,
         bg_pending: false,
+        viewporter: None,
+        bg_viewport: None,
+        запросить_поиск: false,
         hover: None,
         стартовые: None,
         overlay_visible: false,
@@ -751,9 +823,16 @@ fn main() {
                 // Пока обои декодируются в фоне, опрашиваем чаще, чтобы
                 // применить их сразу по готовности, а не через секунду.
                 let идёт_переход = config.fade.as_ref().map(|f| !f.ждём).unwrap_or(false);
-                let таймаут = if config.anim.is_some() || идёт_переход {
+                let таймаут = if config.anim.is_some() || идёт_переход || config.bg_pending {
                 // Живые обои и переход: опрашиваем часто, иначе кадры идут
                 // рывками.
+                //
+                // bg_pending здесь же, и это не украшение: флаг значит, что
+                // кадр обоев НЕ нарисован — оба буфера были у композитора (см.
+                // render_wallpaper). Повторную попытку делает главный цикл, но
+                // без этой ветки он засыпал на секунду, и смена обоев
+                // «иногда» (когда именно в этот момент буфер был занят)
+                // показывалась с задержкой до 1000 мс.
                 15
             } else if config.pending_img.is_some() || config.pending_thumbs.is_some() {
                 30
@@ -966,6 +1045,37 @@ fn main() {
             };
             config.dirty = !ушло;
         }
+
+        // ── Строка поиска ────────────────────────────────────────────────────
+        // Запускаем ТОЛЬКО когда кадр со скрытым меню уже ушёл (dirty снят):
+        // меню лежит на слое Overlay, а fuzzel открывается на top, и стоит
+        // поспешить — строка ввода окажется под меню. Проверка `!dirty`
+        // заменяет ожидание: главный цикл сам повторяет попытку каждый
+        // проход, попутно разбирая события, которыми композитор возвращает
+        // буферы.
+        if config.запросить_поиск && !config.dirty {
+            config.запросить_поиск = false;
+            let _ = conn.flush();
+
+            let ответ = спросить_запрос(&config.запрос);
+
+            config.overlay_visible = true;
+            if let Some(новый) = ответ {
+                config.запрос = новый;
+                // Искать по своим обоям нечего — их пять штук и они все на
+                // виду. Поэтому поиск всегда уводит в сеть: с «моих»
+                // переходим на картинки.
+                if config.вкладка == Вкладка::Мои {
+                    config.вкладка = Вкладка::Картинки;
+                }
+                config.находки.clear();
+                config.сетевые_миниатюры.clear();
+                config.scroll_row = 0;
+                загрузить_страницу(&mut config, 1, false);
+            }
+            build_ui_layout(&mut config);
+            config.dirty = true;
+        }
     }
 }
 
@@ -1081,6 +1191,9 @@ impl Dispatch<WlRegistry, ()> for Config {
             match interface.as_str() {
                 "wl_compositor" => state.compositor = Some(registry.bind(name, version, qh, ())),
                 "wl_shm" => state.shm = Some(registry.bind(name, version, qh, ())),
+                // Необязателен: под композитором без него dwall просто
+                // масштабирует кадры сам, как раньше (см. render_wallpaper).
+                "wp_viewporter" => state.viewporter = Some(registry.bind(name, version, qh, ())),
                 "zwlr_layer_shell_v1" => {
                     state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
                 }
@@ -1246,7 +1359,13 @@ impl Dispatch<WlPointer, ()> for Config {
                 // ПКМ по карточке — то же удаление, что и крестиком, но
                 // попасть проще: целиться в кнопку 28×28 мышью не всегда
                 // удобно, а промах по ней выбирает обои и закрывает меню.
+                const BTN_LEFT: u32 = 0x110;
                 const BTN_RIGHT: u32 = 0x111;
+                // Меню слушает ровно две кнопки. Раньше условие было «любая
+                // нажатая», и боковые кнопки мыши (0x113/0x114 — «вперёд» и
+                // «назад», их легко задеть ладонью) молча выбирали обои и
+                // закрывали меню.
+                if button != BTN_LEFT && button != BTN_RIGHT { return; }
                 let правая = button == BTN_RIGHT;
                 // Курсор вне поверхности помечен как -1: `as u32` в Rust
                 // насыщает отрицательное к нулю, так что без этой проверки
@@ -1270,31 +1389,26 @@ impl Dispatch<WlPointer, ()> for Config {
                     Some(UiAction::Scroll(шаг)) => прокрутить(state, шаг),
                     Some(UiAction::Вкладка(в)) => открыть_вкладку(state, в),
                     Some(UiAction::Поиск) => {
-                        // Меню — слой Overlay, оно рисуется ПОВЕРХ обычных
-                        // окон, а fuzzel окно обычное. Не убрав меню, мы бы
-                        // спрятали строку ввода под ним — ровно та же беда
-                        // была с проводником по «плюсику».
+                        // Меню — слой Overlay, то есть ВЫШЕ слоя top, на
+                        // котором открывается fuzzel. Значит убрать меню надо
+                        // ДО запуска строки ввода, иначе она откроется под ним
+                        // и снаружи это выглядит как «поиск не появился».
+                        //
+                        // Раньше здесь стояло `hide_overlay(state)` без
+                        // проверки результата, а она возвращает false, когда
+                        // оба буфера ещё у композитора. Кадр не уходил, меню
+                        // оставалось на экране — и тем чаще, чем больше окон
+                        // на экране, потому что буферы отпускаются медленнее.
+                        //
+                        // Поэтому только ПРОСИМ поиск, а запускаем его из
+                        // главного цикла — там уже есть готовый механизм
+                        // «повторять, пока кадр не ушёл» (см. state.dirty), и
+                        // там же обрабатываются события композитора, без
+                        // которых буфер никогда не освободится. Делать
+                        // roundtrip прямо отсюда нельзя: мы внутри разбора
+                        // очереди событий.
                         state.overlay_visible = false;
-                        hide_overlay(state);
-                        let _ = conn.flush();
-
-                        let ответ = спросить_запрос(&state.запрос);
-
-                        state.overlay_visible = true;
-                        if let Some(новый) = ответ {
-                            state.запрос = новый;
-                            // Искать по своим обоям нечего — их пять штук и
-                            // они все на виду. Поэтому поиск всегда уводит в
-                            // сеть: с «моих» переходим на картинки.
-                            if state.вкладка == Вкладка::Мои {
-                                state.вкладка = Вкладка::Картинки;
-                            }
-                            state.находки.clear();
-                            state.сетевые_миниатюры.clear();
-                            state.scroll_row = 0;
-                            загрузить_страницу(state, 1, false);
-                        }
-                        build_ui_layout(state);
+                        state.запросить_поиск = true;
                         state.dirty = true;
                     }
                     Some(UiAction::ВзятьИзСети(idx)) => взять_из_сети(state, idx),
@@ -1406,6 +1520,14 @@ impl Dispatch<WlRegion, ()> for Config {
     fn event(_: &mut Self, _: &WlRegion, _: <WlRegion as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
+// У viewporter и самого viewport событий нет — только запросы от нас.
+impl Dispatch<WpViewporter, ()> for Config {
+    fn event(_: &mut Self, _: &WpViewporter, _: <WpViewporter as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WpViewport, ()> for Config {
+    fn event(_: &mut Self, _: &WpViewport, _: <WpViewport as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
 // ── Layer setup ──────────────────────────────────────────────────────────────
 
 fn setup_layers(state: &mut Config) {
@@ -1423,6 +1545,11 @@ fn setup_layers(state: &mut Config) {
     bg_layer.set_size(0, 0);
     bg_layer.set_anchor(zwlr_layer_surface_v1::Anchor::all());
     bg_layer.set_exclusive_zone(-1);
+    // Viewport фоновой поверхности. Заводим один раз на всю жизнь поверхности;
+    // прямоугольники задаются позже, на каждом кадре (см. render_wallpaper).
+    if let Some(ref vp) = state.viewporter {
+        state.bg_viewport = Some(vp.get_viewport(&bg, qh, ()));
+    }
     bg.commit();
     state.bg_surface = Some(bg);
     state.bg_layer = Some(bg_layer);
@@ -1457,18 +1584,38 @@ fn render_wallpaper(state: &mut Config) {
         None => return,
     };
     if w == 0 || h == 0 { return; }
-    let buf_size = (w * h * 4) as usize;
+
+    // ── Размер буфера ───────────────────────────────────────────────────────
+    // С wp_viewporter буфер равен размеру КАДРА, а не экрана: композитор сам
+    // растянет его на видеокарте. Это и есть вся оптимизация. Живые обои
+    // 1280×720 на экране 3840×2160 — это 3.7 МБ на кадр вместо 33 МБ, и ни
+    // одного масштабирования на процессоре: мы просто копируем кадр как есть.
+    //
+    // Замер 09.08.2026 до правки: ffmpeg растягивал сам — 264% CPU; после
+    // переноса растягивания в dwall (blit_scaled) — 21% у ffmpeg и 48% у
+    // dwall. Теперь растягивать не должен никто из них.
+    //
+    // Без viewporter (другой композитор) всё как раньше — буфер размером с
+    // экран, растягиваем сами.
+    let по_viewport = state.bg_viewport.is_some();
+    let (bw, bh) = match (по_viewport, state.img.as_ref()) {
+        (true, Some((iw, ih, _))) if *iw > 0 && *ih > 0 => (*iw, *ih),
+        _ => (w, h),
+    };
+    let buf_size = (bw * bh * 4) as usize;
 
     // ── Два постоянных буфера вместо нового на каждый кадр ──────────────────
     // Пишем всегда в тот, что не показан сейчас. Раньше каждый кадр создавал
     // memfd, mmap, пул и wl_buffer — на живых обоях это десятки раз в секунду.
-    if state.bg_dims != (w, h) || state.bg_slots.len() < 2 {
+    if state.bg_dims != (bw, bh) || state.bg_slots.len() < 2 {
         state.bg_slots.clear();
         let (Some(shm), Some(qh)) = (state.shm.as_ref(), state.qh.as_ref()) else { return };
-        let Some(slots) = make_slots(shm, qh, w, h) else { return };
+        let Some(slots) = make_slots(shm, qh, bw, bh) else { return };
         state.bg_slots = slots;
-        state.bg_dims = (w, h);
+        state.bg_dims = (bw, bh);
         state.bg_slot = 0;
+        // Кэш растянутой картинки считался под старый размер.
+        state.scaled = None;
     }
 
     // Статичные обои готовим ОДИН раз: растягиваем под выход и переводим в
@@ -1477,7 +1624,9 @@ fn render_wallpaper(state: &mut Config) {
     //
     // Считаем в локальную переменную, а не прямо в state.scaled: пока живо
     // заимствование state.img, писать в state нельзя.
-    let новый_кэш = if state.anim.is_none() && state.scaled.is_none() {
+    // В режиме viewport кэш не нужен вовсе: буфер равен размеру картинки, и
+    // «растягивание» сводится к копированию.
+    let новый_кэш = if !по_viewport && state.anim.is_none() && state.scaled.is_none() {
         let bgra = state.img_bgra;
         state.img.as_ref().and_then(|(iw, ih, px)| {
             let mut кадр = if *iw == w && *ih == h && px.len() >= buf_size {
@@ -1524,9 +1673,10 @@ fn render_wallpaper(state: &mut Config) {
                 dst.copy_from_slice(&кэш[..buf_size]);
             }
         }
-        // Кадр уже нужного размера (так отдаёт ffmpeg) — просто копируем.
-        // Ни масштабирования, ни свопа: самый дешёвый путь, ради него всё.
-        Some((iw, ih, ref px)) if iw == w && ih == h && px.len() >= buf_size => {
+        // Кадр уже нужного размера — просто копируем. Ни масштабирования, ни
+        // свопа: самый дешёвый путь, ради него всё. С viewporter сюда попадает
+        // ЛЮБОЙ кадр, потому что буфер под него и заведён.
+        Some((iw, ih, ref px)) if iw == bw && ih == bh && px.len() >= buf_size => {
             dst.copy_from_slice(&px[..buf_size]);
             if !state.img_bgra {
                 for c in dst.chunks_exact_mut(4) { c.swap(0, 2); }
@@ -1541,12 +1691,12 @@ fn render_wallpaper(state: &mut Config) {
         // посчитанной таблицей столбцов пишет ровно один раз и никаких
         // аллокаций не делает.
         Some((iw, ih, ref px)) if state.anim.is_some() && iw > 0 && ih > 0 => {
-            blit_scaled(px, iw, ih, dst, w, h, state.img_bgra);
+            blit_scaled(px, iw, ih, dst, bw, bh, state.img_bgra);
         }
         // Статичная картинка — путь прежний, качественный: она масштабируется
         // один раз при выборе, экономить тут нечего.
         Some((iw, ih, ref px)) => {
-            let mut rgba = resize(iw, ih, px, w, h);
+            let mut rgba = resize(iw, ih, px, bw, bh);
             if !state.img_bgra {
                 for c in rgba.chunks_exact_mut(4) { c.swap(0, 2); }
             }
@@ -1561,6 +1711,19 @@ fn render_wallpaper(state: &mut Config) {
     // прямо на месте — лишний буфер на весь экран (это десятки мегабайт) тут
     // ни к чему.
     if let Some(fade) = state.fade.as_mut() {
+        // Снимок сделан под ПРОШЛЫЕ обои, а у новых свой размер кадра (с
+        // viewporter это обычное дело). Подгоняем один раз за переход, а не на
+        // каждом кадре: дальше размеры уже совпадут.
+        if !fade.ждём && fade.dims != (bw, bh) && fade.dims.0 > 0 && fade.dims.1 > 0 {
+            let mut подогнан = vec![0u8; buf_size];
+            blit_scaled(
+                &fade.from, fade.dims.0, fade.dims.1,
+                &mut подогнан, bw, bh,
+                true, // в буферах уже BGRA, менять местами нечего
+            );
+            fade.from = подогнан;
+            fade.dims = (bw, bh);
+        }
         if fade.ждём {
             // Новые обои ещё не готовы — показываем старый кадр как есть.
         } else if fade.from.len() >= dst.len() {
@@ -1586,11 +1749,32 @@ fn render_wallpaper(state: &mut Config) {
         }
     }
 
+    // ── Viewport: какой кусок буфера и куда растянуть ───────────────────────
+    // Задаём тот же закон, что раньше исполнял blit_scaled: «заполнить» —
+    // масштаб по большей стороне, лишнее обрезаем поровну с двух краёв.
+    // Считает это теперь композитор на видеокарте, и он же фильтрует, поэтому
+    // «лесенки» от ближайшего соседа больше нет.
+    //
+    // set_source задаётся в координатах БУФЕРА и принимает дробные числа,
+    // set_destination — в логических пикселях экрана.
+    if let Some(vp) = state.bg_viewport.as_ref() {
+        let k = (w as f64 / bw as f64).max(h as f64 / bh as f64);
+        let вид_w = (w as f64 / k).min(bw as f64).max(1.0);
+        let вид_h = (h as f64 / k).min(bh as f64).max(1.0);
+        let off_x = (bw as f64 - вид_w) / 2.0;
+        let off_y = (bh as f64 - вид_h) / 2.0;
+        vp.set_source(off_x, off_y, вид_w, вид_h);
+        vp.set_destination(w as i32, h as i32);
+    }
+
     let Some(surface) = state.bg_surface.as_ref() else { return };
     let slot = &state.bg_slots[state.bg_slot];
     slot.free.store(false, Ordering::Relaxed);
     surface.attach(Some(&slot.buffer), 0, 0);
-    surface.damage_buffer(0, 0, w as i32, h as i32);
+    // Порча задаётся в координатах БУФЕРА, а он теперь размером с кадр, а не с
+    // экран: damage_buffer(0,0,w,h) с экранными числами на маленьком буфере
+    // просто выходит за его границы.
+    surface.damage_buffer(0, 0, bw as i32, bh as i32);
     surface.commit();
 }
 
@@ -1605,15 +1789,24 @@ fn начать_переход(state: &mut Config) {
         Some((_, w, h)) => (*w, *h),
         None => return,
     };
-    // Первый запуск (буферов ещё нет) или смена разрешения посреди дела —
-    // показывать переход не от чего, просто ставим обои.
-    if w == 0 || h == 0 || state.bg_slots.is_empty() || state.bg_dims != (w, h) {
+    // Первый запуск: буферов ещё нет, показывать переход не от чего.
+    //
+    // Раньше здесь стояла ещё и проверка bg_dims == (w, h). С viewporter она
+    // отключала бы переход НАВСЕГДА: буфер теперь равен размеру кадра, а не
+    // экрана, и совпадать с ним не обязан. Снимок берём какой есть и запоминаем
+    // его размер — подгонит его render_wallpaper, один раз за переход.
+    if w == 0 || h == 0 || state.bg_slots.is_empty() {
         state.fade = None;
         return;
     }
     let Some(slot) = state.bg_slots.get(state.bg_slot) else { return };
     let текущий = unsafe { std::slice::from_raw_parts(slot.ptr, slot.len) }.to_vec();
-    state.fade = Some(Fade { from: текущий, start: None, ждём: true });
+    state.fade = Some(Fade {
+        from: текущий,
+        dims: state.bg_dims,
+        start: None,
+        ждём: true,
+    });
 }
 
 // ── Overlay rendering ────────────────────────────────────────────────────────

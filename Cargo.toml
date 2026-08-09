@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-wayland-protocols = "0.32"
+wayland-protocols = { version = "0.32", features = ["client"] }
 image = "0.25"
 gif = "0.13"
 serde = { version = "1", features = ["derive"] }
