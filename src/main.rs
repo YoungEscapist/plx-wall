@@ -156,6 +156,13 @@ struct ShmSlot {
     ptr: *mut u8,
     len: usize,
     free: std::sync::Arc<AtomicBool>,
+    /// Тот самый memfd, поверх которого лежит `ptr`.
+    ///
+    /// Раньше он закрывался сразу после создания буфера — отображение держит
+    /// себя само. Теперь он нужен живым: декодер заливает кадр прямо в общую
+    /// память через `splice`, а `splice` умеет писать только в файловый
+    /// дескриптор (см. [`Заём`]).
+    fd: OwnedFd,
 }
 
 impl Drop for ShmSlot {
@@ -182,12 +189,13 @@ fn make_slots(
         let (fd, ptr) = create_shm_fd(size)?;
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         let pool = shm.create_pool(owned.as_fd(), size as i32, qh, ());
+        // owned дальше переезжает в сам слот — см. поле ShmSlot::fd.
         let free = std::sync::Arc::new(AtomicBool::new(true));
         let buffer = pool.create_buffer(
             0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888, qh, free.clone(),
         );
         pool.destroy(); // отображение держит сам буфер
-        out.push(ShmSlot { buffer, ptr: ptr as *mut u8, len: size, free });
+        out.push(ShmSlot { buffer, ptr: ptr as *mut u8, len: size, free, fd: owned });
     }
     Some(out)
 }
@@ -207,6 +215,32 @@ fn take_free_slot(slots: &[ShmSlot], last: usize) -> Option<usize> {
     None
 }
 
+/// Что декодер прислал главному циклу.
+enum Кадр {
+    /// Видео: кадр УЖЕ лежит в общей памяти, в слоте с этим номером.
+    ///
+    /// Так дешевле всего: `splice` перекладывает страницы трубы прямо в memfd
+    /// слота, и ни одного копирования на нашей стороне не остаётся. Замер
+    /// 14.08.2026 на 2560×1080 (свой стенд, 120 кадров): «прочитать в буфер и
+    /// скопировать в общую память» — 12.77 мс CPU на кадр, `splice` — 7.94 мс.
+    ВСлоте { слот: usize, шаг: std::time::Duration },
+    /// gif: кадр приходит своим буфером. Там он собирается на холсте из
+    /// заплаток (см. декодер gif), общей памятью это не заменить, да и незачем
+    /// — гифы мелкие.
+    Буфером { w: u32, h: u32, px: Vec<u8>, шаг: std::time::Duration },
+}
+
+/// Слот, отданный декодеру во временное пользование.
+///
+/// Внутри — ДУБЛИКАТ дескриптора, а не сам слот: обои могут смениться, старые
+/// слоты уйдут вместе с их памятью, и опоздавший декодер зальёт кадр в свою
+/// копию memfd, которую никто не читает. Без дубликата он писал бы по номеру
+/// дескриптора, который ядро успело выдать чему-то другому.
+struct Заём {
+    индекс: usize,
+    fd: OwnedFd,
+}
+
 /// Проигрыватель живых обоев.
 ///
 /// Кадры готовит фоновый поток и кладёт в канал ёмкостью 1 — он же служит
@@ -217,7 +251,16 @@ struct Anim {
     /// Кадр: ширина, высота, пиксели, СОБСТВЕННАЯ длительность кадра и признак
     /// «уже BGRA». Длительность — Duration, а не миллисекунды: у видео 60 к/с
     /// это 16 666 мкс, и округление до 16 мс дало бы 62.5 к/с вместо 60.
-    rx: std::sync::mpsc::Receiver<(u32, u32, Vec<u8>, std::time::Duration, bool)>,
+    rx: std::sync::mpsc::Receiver<Кадр>,
+    /// Куда главный цикл кладёт свободные слоты для декодера. Он же и тормоз:
+    /// пока слотов нет (кадр показывается, обои закрыты полноэкранным окном),
+    /// декодер стоит на `recv`, очередь ffmpeg переполняется, и тот засыпает
+    /// сам.
+    слоты: std::sync::mpsc::Sender<Заём>,
+    /// Размер кадра, который отдаёт декодер. Нужен ЗАРАНЕЕ: слоты общей памяти
+    /// заводятся под него ещё до первого кадра — заливать-то декодер будет
+    /// прямо в них.
+    dims: (u32, u32),
     next_at: std::time::Instant,
     /// Живой ffmpeg. В Drop его обязательно убиваем: иначе при смене обоев
     /// процессы копятся и продолжают декодировать в никуда.
@@ -479,12 +522,61 @@ fn is_video(path: &str) -> bool {
     )
 }
 
+/// Залить очередной кадр из трубы ffmpeg прямо в общую память слота.
+///
+/// `splice` перекладывает страницы трубы в memfd силами ядра — на нашей
+/// стороне не остаётся ни чтения в буфер, ни копирования из него в общую
+/// память. Замер 14.08.2026 на стенде (2560×1080, 120 кадров, тот же ffmpeg):
+///
+/// | как забираем кадр | CPU на кадр |
+/// |---|---|
+/// | `read_exact` в буфер + копия в общую память | 12.77 мс |
+/// | `splice` прямо в memfd слота | **7.94 мс** |
+///
+/// Расширение самой трубы (`F_SETPIPE_SZ` до мегабайта) на том же стенде не
+/// дало НИЧЕГО (9.0 против 9.5 мс на кадр) — платим не за системные вызовы, а
+/// за перекладывание мегабайтов, поэтому его и не делаем.
+///
+/// `false` = труба кончилась (ffmpeg завершился или его убили).
+fn залить_кадр(труба: &impl std::os::fd::AsRawFd, заём: &Заём, размер: usize) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut залито = 0usize;
+    while залито < размер {
+        // Смещение в файле ведём сами: splice с указателем на смещение не
+        // трогает позицию дескриптора, и слот можно заливать с начала снова и
+        // снова.
+        let mut смещение = залито as libc::loff_t;
+        let n = unsafe {
+            libc::splice(
+                труба.as_raw_fd(), std::ptr::null_mut(),
+                заём.fd.as_raw_fd(), &mut смещение,
+                размер - залито, 0,
+            )
+        };
+        match n {
+            0 => return false,             // труба закрыта — ffmpeg кончился
+            n if n < 0 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+                eprintln!("dwall: splice кадра не удался: {e}");
+                return false;
+            }
+            n => залито += n as usize,
+        }
+    }
+    true
+}
+
 /// Запускает фоновое декодирование живых обоев под размер экрана `w`×`h`.
 fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
     use std::sync::mpsc::sync_channel;
-    let (tx, rx) = sync_channel::<(u32, u32, Vec<u8>, std::time::Duration, bool)>(1);
+    let (tx, rx) = sync_channel::<Кадр>(1);
 
     if is_video(path) {
+        // Канал слотов: главный цикл кладёт сюда свободную общую память,
+        // декодер заливает в неё кадр. Ёмкости не задаём — слотов всего два,
+        // больше в канале и не окажется.
+        let (выдать_слот, взять_слот) = std::sync::mpsc::channel::<Заём>();
         // Кадры просим в BGRA — конвертировать на нашей стороне дороже.
         // -stream_loop -1 — бесконечный повтор.
         //
@@ -536,31 +628,33 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
         let (поток_child, поток_stop) = (child.clone(), stop.clone());
         let путь = path.to_string();
         std::thread::spawn(move || {
-            use std::io::Read;
             // Размер кадра — тот, в котором его отдаёт ffmpeg, а он теперь не
             // обязан совпадать с экраном (см. выбор `цель` выше).
             let кадр = (вых_w as usize) * (вых_h as usize) * 4;
-            let mut buf = vec![0u8; кадр];
             let mut hw = hw;
             loop {
                 // Забираем stdout только что запущенного процесса.
                 let out = поток_child.lock().ok().and_then(|mut g| {
                     g.as_mut().and_then(|c| c.stdout.take())
                 });
-                let Some(mut out) = out else { return };
+                let Some(out) = out else { return };
 
                 let mut кадров = 0u64;
                 loop {
-                    if out.read_exact(&mut buf).is_err() {
+                    // Ждём, пока главный цикл отдаст свободный слот. Это и есть
+                    // тормоз всего конвейера: пока показывать некуда, мы стоим
+                    // здесь, труба ffmpeg переполняется, и он засыпает сам.
+                    // Ошибка = главный цикл выбросил Anim, уходим.
+                    let Ok(заём) = взять_слот.recv() else { return };
+                    if !залить_кадр(&out, &заём, кадр) {
                         break; // ffmpeg закончился или его убили
                     }
                     кадров += 1;
                     // Свежий буфер вместо clone: read_exact всё равно перезапишет
                     // его целиком, а копия 11 МБ на кадр — это 165 МБ/с memcpy
                     // впустую.
-                    let готов = std::mem::replace(&mut buf, vec![0u8; кадр]);
                     // Ошибка отправки = главный цикл выбросил Anim, уходим.
-                    if tx.send((вых_w, вых_h, готов, шаг, true)).is_err() {
+                    if tx.send(Кадр::ВСлоте { слот: заём.индекс, шаг }).is_err() {
                         return;
                     }
                 }
@@ -584,7 +678,14 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
                 return;
             }
         });
-        return Some(Anim { rx, next_at: std::time::Instant::now(), child, stop });
+        return Some(Anim {
+            rx,
+            слоты: выдать_слот,
+            dims: (вых_w, вых_h),
+            next_at: std::time::Instant::now(),
+            child,
+            stop,
+        });
     }
 
     // ── GIF ──────────────────────────────────────────────────────────────────
@@ -670,7 +771,7 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
                 // и есть исходная.
                 let ms = if f.delay == 0 { 100 } else { f.delay as u64 * 10 };
                 let шаг = std::time::Duration::from_millis(ms);
-                if tx.send((sw as u32, sh as u32, кадр, шаг, true)).is_err() {
+                if tx.send(Кадр::Буфером { w: sw as u32, h: sh as u32, px: кадр, шаг }).is_err() {
                     return; // главный цикл выбросил Anim
                 }
 
@@ -696,8 +797,16 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
         }
     });
     // У gif своего процесса нет — убивать в Drop нечего.
+    // У gif своего процесса нет — убивать в Drop нечего, и слоты ему не нужны:
+    // кадр он собирает у себя на холсте. Канал слотов заводим пустым, чтобы
+    // поле было одно на оба вида живых обоев.
+    let (выдать_слот, _) = std::sync::mpsc::channel::<Заём>();
     Some(Anim {
         rx,
+        слоты: выдать_слот,
+        // Слоты общей памяти gif не нужны (кадр он собирает на своём холсте),
+        // поэтому размер нулевой — по нему одолжить_слоты и не берётся за дело.
+        dims: (0, 0),
         next_at: std::time::Instant::now(),
         child: std::sync::Arc::new(std::sync::Mutex::new(None)),
         stop: std::sync::Arc::new(AtomicBool::new(false)),
@@ -766,6 +875,12 @@ struct Config {
     anim: Option<Anim>,
     /// Обои сейчас на экране видно (композитор отвечает на кадровые запросы).
     видно: bool,
+    /// Кадр живых обоев, который декодер уже залил в общую память: номер слота
+    /// и его размер. Пока он взведён, render_wallpaper НЕ заполняет буфер —
+    /// там уже лежит готовый кадр (см. Кадр::ВСлоте).
+    кадр_слота: Option<(usize, u32, u32)>,
+    /// Слоты, отданные декодеру: в них он прямо сейчас пишет, трогать нельзя.
+    слоты_у_декодера: Vec<bool>,
     /// Когда заказан кадровый callback, на который ещё не ответили. Молчание
     /// дольше [`ОЖИДАНИЕ_КАДРА`] значит «обои закрыты, можно спать».
     кадр_заказан: Option<std::time::Instant>,
@@ -918,6 +1033,8 @@ fn main() {
         pending_thumbs: None,
         anim: None,
         видно: true,
+        кадр_слота: None,
+        слоты_у_декодера: Vec::new(),
         кадр_заказан: None,
         callback_был: false,
         img_bgra: false,
@@ -1138,13 +1255,20 @@ fn main() {
             }
         }
 
+        // Живые обои: сначала отдаём декодеру всё, во что он может писать.
+        одолжить_слоты(&mut config);
+
         // Живые обои: забираем очередной кадр, когда подошёл его срок.
         let видно = config.видно;
         if let Some(anim) = config.anim.as_mut().filter(|_| видно) {
             let сейчас = std::time::Instant::now();
             if сейчас >= anim.next_at {
                 match anim.rx.try_recv() {
-                    Ok((w, h, px, шаг, bgra)) => {
+                    Ok(кадр) => {
+                        let шаг = match &кадр {
+                            Кадр::ВСлоте { шаг, .. } => *шаг,
+                            Кадр::Буфером { шаг, .. } => *шаг,
+                        };
                         // Срок следующего кадра отсчитываем от СРОКА текущего, а
                         // не от «сейчас»: иначе к каждому кадру прибавлялось бы
                         // опоздание главного цикла, и ролик на 60 к/с полз бы
@@ -1156,8 +1280,22 @@ fn main() {
                         } else {
                             anim.next_at + шаг
                         };
-                        config.img_bgra = bgra;
-                        config.img = Some((w, h, px));
+                        config.img_bgra = true; // и видео, и gif отдают BGRA
+                        match кадр {
+                            // Кадр уже в общей памяти — заполнять нечего,
+                            // остаётся показать (см. render_wallpaper).
+                            Кадр::ВСлоте { слот, .. } => {
+                                let (dw, dh) = config.anim.as_ref().map(|a| a.dims).unwrap_or((0, 0));
+                                if let Some(занят) = config.слоты_у_декодера.get_mut(слот) {
+                                    *занят = false;
+                                }
+                                config.кадр_слота = Some((слот, dw, dh));
+                            }
+                            Кадр::Буфером { w, h, px, .. } => {
+                                config.кадр_слота = None;
+                                config.img = Some((w, h, px));
+                            }
+                        }
                         // Первый кадр новых живых обоев — с него и начинается
                         // переход.
                         if let Some(f) = config.fade.as_mut() { f.ждём = false; }
@@ -2008,8 +2146,12 @@ fn render_wallpaper(state: &mut Config) {
     // Без viewporter (другой композитор) всё как раньше — буфер размером с
     // экран, растягиваем сами.
     let по_viewport = state.bg_viewport.is_some();
-    let (bw, bh) = match (по_viewport, state.img.as_ref()) {
-        (true, Some((iw, ih, _))) if *iw > 0 && *ih > 0 => (*iw, *ih),
+    // Кадр, залитый декодером прямо в общую память, задаёт размер сам: своего
+    // `img` у него нет и быть не должно — весь смысл в том, что кадр нигде,
+    // кроме слота, не лежит.
+    let (bw, bh) = match (state.кадр_слота, по_viewport, state.img.as_ref()) {
+        (Some((_, dw, dh)), _, _) if dw > 0 && dh > 0 => (dw, dh),
+        (_, true, Some((iw, ih, _))) if *iw > 0 && *ih > 0 => (*iw, *ih),
         _ => (w, h),
     };
     let buf_size = (bw * bh * 4) as usize;
@@ -2065,15 +2207,29 @@ fn render_wallpaper(state: &mut Config) {
     // просто потерять, а вот единственный кадр статичной картинки потерять
     // нельзя, иначе обои так и не появятся. Флаг заставит главный цикл
     // повторить попытку.
-    let Some(next) = take_free_slot(&state.bg_slots, state.bg_slot) else {
-        state.bg_pending = true;
-        return;
+    // Кадр от декодера уже лежит в своём слоте — его и показываем, ничего не
+    // заполняя. Это и есть вся экономия: кадр приходит из ffmpeg сразу в ту
+    // память, которую заберёт композитор.
+    let готовый = state.кадр_слота.and_then(|(i, _, _)| (i < state.bg_slots.len()).then_some(i));
+    let next = match готовый {
+        Some(i) => i,
+        None => match take_free_slot(&state.bg_slots, state.bg_slot) {
+            Some(i) => i,
+            None => {
+                state.bg_pending = true;
+                return;
+            }
+        },
     };
     state.bg_pending = false;
     state.bg_slot = next;
     let slot = &state.bg_slots[state.bg_slot];
     let dst = unsafe { std::slice::from_raw_parts_mut(slot.ptr, slot.len) };
 
+    if готовый.is_some() {
+        // Заполнять нечего. Дальше по коду — переход и viewport, они работают
+        // поверх уже лежащего кадра.
+    } else {
     match state.img {
         // Статичные обои идут через кэш: во время перехода кадр собирается
         // заново каждые ~16 мс, а Lanczos на 4K столько раз не потянуть.
@@ -2114,6 +2270,7 @@ fn render_wallpaper(state: &mut Config) {
             dst.copy_from_slice(&rgba[..buf_size]);
         }
         None => dst.fill(35),
+    }
     }
 
     // ── Плавный переход ─────────────────────────────────────────────────────
@@ -2198,6 +2355,57 @@ fn render_wallpaper(state: &mut Config) {
     // просто выходит за его границы.
     surface.damage_buffer(0, 0, bw as i32, bh as i32);
     surface.commit();
+}
+
+/// Отдать декодеру видео свободные слоты общей памяти.
+///
+/// Он пишет кадр прямо в них (см. [`залить_кадр`]), поэтому слот можно
+/// одалживать, только когда его отпустил композитор (`free`) и когда он не
+/// показан прямо сейчас. Пока обои закрыты полноэкранным окном, не одалживаем
+/// вовсе — декодер встаёт на `recv`, ffmpeg упирается в трубу и засыпает.
+///
+/// Слоты заводятся здесь же, по размеру кадра из [`Anim::dims`]: декодеру они
+/// нужны ДО первого кадра, а render_wallpaper узнаёт размер только из готового.
+fn одолжить_слоты(state: &mut Config) {
+    let Some((dw, dh)) = state.anim.as_ref().map(|a| a.dims) else { return };
+    if dw == 0 || dh == 0 || !state.видно || state.bg_viewport.is_none() {
+        // Без viewporter кадр надо ещё растянуть под экран, то есть через
+        // буфер — тогда работает прежний путь с копированием.
+        return;
+    }
+    if state.bg_dims != (dw, dh) || state.bg_slots.len() < 2 {
+        let (Some(shm), Some(qh)) = (state.shm.as_ref(), state.qh.as_ref()) else { return };
+        let Some(slots) = make_slots(shm, qh, dw, dh) else { return };
+        state.bg_slots = slots;
+        state.bg_dims = (dw, dh);
+        state.bg_slot = 0;
+        state.кадр_слота = None;
+        state.scaled = None;
+        state.слоты_у_декодера = vec![false; state.bg_slots.len()];
+    }
+    if state.слоты_у_декодера.len() != state.bg_slots.len() {
+        state.слоты_у_декодера = vec![false; state.bg_slots.len()];
+    }
+
+    let показан = state.bg_slot;
+    let есть_кадр = state.кадр_слота.map(|(i, _, _)| i);
+    for i in 0..state.bg_slots.len() {
+        if state.слоты_у_декодера[i] || Some(i) == есть_кадр {
+            continue;
+        }
+        // Показанный слот держит композитор — он же снимет `free` при release.
+        if i == показан && !state.bg_slots[i].free.load(Ordering::Relaxed) {
+            continue;
+        }
+        if !state.bg_slots[i].free.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Ok(fd) = state.bg_slots[i].fd.try_clone() else { continue };
+        let Some(anim) = state.anim.as_ref() else { return };
+        if anim.слоты.send(Заём { индекс: i, fd }).is_ok() {
+            state.слоты_у_декодера[i] = true;
+        }
+    }
 }
 
 /// Снять то, что сейчас на экране, — с этого кадра пойдёт переход к новым
