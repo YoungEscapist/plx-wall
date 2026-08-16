@@ -12,6 +12,8 @@
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod ffmpeg_sys;
+mod hwvideo;
 mod online;
 mod palette;
 
@@ -36,6 +38,13 @@ use wayland_client::{
 // Растягивание при этом делает композитор на видеокарте, а не мы на процессоре.
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
+// linux-dmabuf: буфер, который лежит в видеопамяти и никогда не приезжал в
+// системную. Через него показываются живые обои, декодированные видеокартой
+// (см. hwvideo.rs) — процессор не касается ни одного пикселя.
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -872,7 +881,42 @@ struct Config {
     pending_thumbs: Option<std::sync::mpsc::Receiver<Vec<(u32, u32, Vec<u8>)>>>,
     /// Живые обои: mp4/webm/mkv через ffmpeg и анимированный gif своим
     /// декодером. Кадры приходят из фонового потока по одному.
+    ///
+    /// Запасной путь для видео: работает везде, но платит процессором за
+    /// декодирование, перевод в BGRA и перекачку кадров через трубу. Основной
+    /// путь — `hw` ниже; сюда сваливаемся, когда видеокарта этот ролик не
+    /// потянула. Одновременно взведён быть может только один из двух.
     anim: Option<Anim>,
+    /// Живые обои, декодированные видеокартой прямо в видеопамять.
+    ///
+    /// Основной путь для видео. Кадр приезжает готовым dmabuf-буфером, и
+    /// показать его — это прицепить `wl_buffer`: ни декодирования, ни
+    /// перевода цвета, ни копирования на процессоре не остаётся вовсе.
+    /// Замер 15.08.2026 на h264 2560×1440@60: 0.40 с CPU на 300 кадров против
+    /// 15.7 с у пути через ffmpeg.
+    hw: Option<hwvideo::HwВидео>,
+    /// Готовые `wl_buffer` под поверхности VAAPI, по номеру поверхности.
+    ///
+    /// Пул декодера конечен и невелик (на этой машине — 5 поверхностей), а
+    /// кадры идут по кругу, поэтому буферы заводятся один раз и живут до смены
+    /// обоев. Флаг — тот же, что у shm-слотов: снят ли буфер с показа.
+    hw_буферы: std::collections::HashMap<usize, (WlBuffer, std::sync::Arc<AtomicBool>)>,
+    /// Кадры, которые композитор ещё не отпустил.
+    ///
+    /// Держатель не даёт декодеру забрать поверхность обратно в пул и записать
+    /// поверх того, что прямо сейчас на экране. Роняем по `wl_buffer::release`.
+    hw_на_экране: Vec<(std::sync::Arc<AtomicBool>, hwvideo::Держатель)>,
+    /// Срок показа следующего аппаратного кадра.
+    hw_срок: std::time::Instant,
+    /// Глобал linux-dmabuf. Нет его — аппаратный путь недоступен, и видео
+    /// поедет через `anim`.
+    dmabuf: Option<ZwpLinuxDmabufV1>,
+    /// Пары «формат + модификатор», которые композитор объявил поддерживаемыми.
+    ///
+    /// Проверять обязательно: `create_immed` на неподдерживаемом сочетании —
+    /// это протокольная ошибка, то есть мгновенная смерть клиента, а не
+    /// аккуратный отказ. Не нашли своё сочетание — уходим на запасной путь.
+    dmabuf_форматы: std::collections::HashSet<(u32, u64)>,
     /// Обои сейчас на экране видно (композитор отвечает на кадровые запросы).
     видно: bool,
     /// Кадр живых обоев, который декодер уже залил в общую память: номер слота
@@ -993,6 +1037,13 @@ fn main() {
         std::process::exit(palette::режим_палитры(std::env::args().nth(2)));
     }
 
+    // Служебный режим: проверить аппаратное декодирование на конкретном ролике
+    // и показать, что именно отдаёт видеокарта. Композитор не нужен —
+    // проверяется ровно связка libavcodec+VAAPI+dmabuf.
+    if std::env::args().nth(1).as_deref() == Some("--hwtest") {
+        std::process::exit(hwvideo::режим_проверки(std::env::args().nth(2)));
+    }
+
     // Служебный режим: спросить обои у источника и показать, что нашлось.
     // Композитор не нужен — сеть проверяется отдельно от всего остального.
     if std::env::args().nth(1).as_deref() == Some("--online") {
@@ -1046,6 +1097,12 @@ fn main() {
         bg_pending: false,
         viewporter: None,
         bg_viewport: None,
+        hw: None,
+        hw_буферы: std::collections::HashMap::new(),
+        hw_на_экране: Vec::new(),
+        hw_срок: std::time::Instant::now(),
+        dmabuf: None,
+        dmabuf_форматы: std::collections::HashSet::new(),
         запросить_поиск: false,
         запросить_фильтр: false,
         фильтры: online::Фильтры::default(),
@@ -1152,8 +1209,22 @@ fn main() {
                 // готовности кадра poll не узнает, и остаётся опрашивать.
                 // Спящим обоям частый опрос не нужен вовсе: ждём кадрового
                 // callback'а из сокета, а он придёт по POLLIN.
-                let до_кадра = config.anim.as_ref().filter(|_| config.видно).map(|a| {
-                    let ост = a.next_at.saturating_duration_since(std::time::Instant::now());
+                //
+                // Срок берём у ТОГО пути, который сейчас работает: у обоев
+                // через ffmpeg он свой (Anim::next_at), у аппаратных — свой
+                // (hw_срок). Забыть про второй значит вернуть ровно ту дёрганую
+                // картинку, о которой сказано выше: цикл засыпал на секунду и
+                // просыпался только на кадровый callback, поэтому кадр то
+                // успевал к сроку, то опаздывал на целый период.
+                let срок_кадра = match (config.anim.as_ref(), config.hw.as_ref()) {
+                    (Some(a), _) => Some(a.next_at),
+                    // Пока играет переход, аппаратные кадры не забираются
+                    // (см. показать_hw_кадр) — и будить цикл под них незачем.
+                    (None, Some(_)) if config.fade.is_none() => Some(config.hw_срок),
+                    _ => None,
+                };
+                let до_кадра = срок_кадра.filter(|_| config.видно).map(|срок| {
+                    let ост = срок.saturating_duration_since(std::time::Instant::now());
                     (ост.as_micros().div_ceil(1000) as i32).clamp(2, 1000)
                 });
                 // bg_pending и переход — это не украшение: флаг значит, что
@@ -1307,6 +1378,17 @@ fn main() {
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
             }
+        }
+
+        // Живые обои на видеокарте: кадр уже лежит в видеопамяти готовым, и
+        // весь показ — это прицепить wl_buffer.
+        //
+        // Пока играет плавный переход, кадры отсюда НЕ забираем: смешивать
+        // dmabuf нечем, и на экране в это время неподвижный первый кадр ролика
+        // обычным путём через общую память (см. установить_обои). Декодер всё
+        // это время стоит на `send` и не тратит ничего.
+        if config.видно && config.fade.is_none() && config.hw.is_some() {
+            показать_hw_кадр(&mut config);
         }
 
         // Значок загрузки. Крутим его, пока идёт фоновая работа, и один раз
@@ -1711,6 +1793,17 @@ impl Dispatch<WlRegistry, ()> for Config {
                 // Необязателен: под композитором без него dwall просто
                 // масштабирует кадры сам, как раньше (см. render_wallpaper).
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, version, qh, ())),
+                // Тоже необязателен: нет dmabuf — видео поедет через ffmpeg.
+                //
+                // Версию берём не выше 3 СОЗНАТЕЛЬНО. С третьей приходят
+                // события `modifier` со списком поддерживаемых сочетаний
+                // «формат+модификатор», а нам этот список нужен: создавать
+                // буфер вслепую нельзя (см. dmabuf_форматы). Четвёртая версия
+                // заменяет их на feedback с отдельным объектом — лишняя
+                // сложность ради тех же сведений.
+                "zwp_linux_dmabuf_v1" if version >= 3 => {
+                    state.dmabuf = Some(registry.bind(name, version.min(3), qh, ()));
+                }
                 "zwlr_layer_shell_v1" => {
                     state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
                 }
@@ -2068,6 +2161,43 @@ impl Dispatch<WlRegion, ()> for Config {
     fn event(_: &mut Self, _: &WlRegion, _: <WlRegion as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
+/// Глобал linux-dmabuf: копим объявленные композитором сочетания
+/// «формат + модификатор».
+///
+/// Версия 3 шлёт их событиями `modifier` сразу после привязки. Устаревшее
+/// `format` (версия 1) игнорируем: модификатора в нём нет, а без модификатора
+/// буфер всё равно не создать — у видеокарты кадр разложен плиткой, и линейным
+/// его считать нельзя.
+impl Dispatch<ZwpLinuxDmabufV1, ()> for Config {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufV1,
+        event: <ZwpLinuxDmabufV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_linux_dmabuf_v1::Event::Modifier { format, modifier_hi, modifier_lo } = event {
+            let модификатор = ((modifier_hi as u64) << 32) | modifier_lo as u64;
+            state.dmabuf_форматы.insert((format, модификатор));
+        }
+    }
+}
+
+/// Заготовка буфера. Событий ждать не приходится: буфер создаётся через
+/// `create_immed`, то есть сразу и без ответа композитора.
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for Config {
+    fn event(
+        _: &mut Self,
+        _: &ZwpLinuxBufferParamsV1,
+        _: <ZwpLinuxBufferParamsV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 // У viewporter и самого viewport событий нет — только запросы от нас.
 impl Dispatch<WpViewporter, ()> for Config {
     fn event(_: &mut Self, _: &WpViewporter, _: <WpViewporter as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
@@ -2357,6 +2487,173 @@ fn render_wallpaper(state: &mut Config) {
     surface.commit();
 }
 
+/// Завести `wl_buffer` поверх готовых dmabuf-дескрипторов.
+///
+/// `None` — композитор такое сочетание формата с модификатором не объявлял, и
+/// создавать буфер НЕЛЬЗЯ: `create_immed` в этом случае отвечает не отказом, а
+/// протокольной ошибкой, то есть мгновенно убивает клиента.
+fn создать_dmabuf_буфер(
+    state: &Config,
+    описание: &hwvideo::ОписаниеПоверхности,
+) -> Option<(WlBuffer, std::sync::Arc<AtomicBool>)> {
+    let dmabuf = state.dmabuf.as_ref()?;
+    let qh = state.qh.as_ref()?;
+
+    if !state.dmabuf_форматы.contains(&(описание.fourcc, описание.модификатор)) {
+        eprintln!(
+            "dwall: композитор не объявил формат {:?} с модификатором {:#x}",
+            std::str::from_utf8(&описание.fourcc.to_le_bytes()).unwrap_or("?").trim_end(),
+            описание.модификатор,
+        );
+        return None;
+    }
+
+    let params = dmabuf.create_params(qh, ());
+    let (hi, lo) = (
+        (описание.модификатор >> 32) as u32,
+        (описание.модификатор & 0xffff_ffff) as u32,
+    );
+    for (номер, плоскость) in описание.плоскости.iter().enumerate() {
+        params.add(
+            плоскость.fd.as_fd(),
+            номер as u32,
+            плоскость.сдвиг,
+            плоскость.шаг,
+            hi,
+            lo,
+        );
+    }
+
+    // create_immed, а не create: буфер нужен здесь и сейчас, а ждать ответа
+    // композитора в главном цикле — это лишний круг диспетчеризации на каждую
+    // новую поверхность. Сочетание формата с модификатором мы уже проверили
+    // выше, так что протокольной ошибке взяться неоткуда.
+    let свободен = std::sync::Arc::new(AtomicBool::new(true));
+    let буфер = params.create_immed(
+        описание.ширина as i32,
+        описание.высота as i32,
+        описание.fourcc,
+        zwp_linux_buffer_params_v1::Flags::empty(),
+        qh,
+        свободен.clone(),
+    );
+    // Заготовка своё отработала: буфер от неё уже не зависит.
+    params.destroy();
+
+    Some((буфер, свободен))
+}
+
+/// Показать очередной кадр аппаратных живых обоев.
+///
+/// Здесь нет ни единого касания пикселей: кадр приехал готовым буфером в
+/// видеопамяти, и вся работа — прицепить его к поверхности.
+fn показать_hw_кадр(state: &mut Config) {
+    // Кадры, которые композитор снял с показа, отпускаем: пока держатель жив,
+    // декодер не может забрать поверхность обратно в пул.
+    state.hw_на_экране.retain(|(свободен, _)| !свободен.load(Ordering::Relaxed));
+
+    // Пока не подтверждён первый configure, attach запрещён протоколом.
+    if !state.bg_configured {
+        return;
+    }
+    let сейчас = std::time::Instant::now();
+    if сейчас < state.hw_срок {
+        return;
+    }
+
+    // Забираем кадр. Первый кадр забран ещё при запуске декодера — там по нему
+    // проверялось, что видеокарта вообще потянула этот кодек (см. hwvideo.rs),
+    // и показать его надо прежде всего остального.
+    let первый = state.hw.as_mut().and_then(|hw| hw.первый.take());
+    let кадр = match первый {
+        Some(кадр) => кадр,
+        None => match state.hw.as_ref().map(|hw| hw.rx.try_recv()) {
+            Some(Ok(кадр)) => кадр,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return,
+            // Поток декодера кончился (битый файл, карта отказала на середине).
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                state.hw = None;
+                return;
+            }
+            None => return,
+        },
+    };
+
+    // Срок следующего кадра отсчитываем от срока текущего, а не от «сейчас»:
+    // иначе к каждому кадру прибавлялось бы опоздание главного цикла, и ролик
+    // на 60 к/с полз бы медленнее реального времени. Отстали больше чем на
+    // кадр — догонять нечем, начинаем отсчёт заново.
+    state.hw_срок = if сейчас.duration_since(state.hw_срок) > кадр.шаг {
+        сейчас + кадр.шаг
+    } else {
+        state.hw_срок + кадр.шаг
+    };
+
+    // Поверхность, которую видим впервые, — заводим под неё буфер. Дальше она
+    // будет узнаваться по номеру, и протокольной работы не останется вовсе.
+    if let Some(описание) = кадр.описание.as_ref() {
+        match создать_dmabuf_буфер(state, описание) {
+            Some(пара) => {
+                state.hw_буферы.insert(описание.surface_id, пара);
+            }
+            None => {
+                // Композитор такого не примет — уходим на путь через ffmpeg.
+                eprintln!("dwall: dmabuf не принят композитором, откат на ffmpeg");
+                state.hw = None;
+                state.hw_на_экране.clear();
+                let (w, h) = state.outputs.first().map(|(_, w, h)| (*w, *h)).unwrap_or((0, 0));
+                let путь = state.wallpapers.get(state.current).cloned();
+                if let (Some(путь), true) = (путь, w > 0 && h > 0) {
+                    state.anim = start_anim(&путь, w, h);
+                }
+                return;
+            }
+        }
+    }
+
+    let Some((буфер, свободен)) = state.hw_буферы.get(&кадр.surface_id) else { return };
+    let (буфер, свободен) = (буфер.clone(), свободен.clone());
+
+    // ── Куда растянуть ──────────────────────────────────────────────────────
+    // Тот же закон «заполнить», что и у обычного пути: масштаб по большей
+    // стороне, лишнее срезаем поровну с краёв. Считает это композитор на
+    // видеокарте, поэтому кадр 2560×1440 честно фильтруется до 3840×2160, а не
+    // растягивается ближайшим соседом.
+    let (эw, эh) = match state.outputs.first() {
+        Some((_, w, h)) if *w > 0 && *h > 0 => (*w, *h),
+        _ => return,
+    };
+    let (кw, кh) = state.hw.as_ref().map(|hw| hw.размер).unwrap_or((эw, эh));
+    if кw == 0 || кh == 0 {
+        return;
+    }
+    if let Some(vp) = state.bg_viewport.as_ref() {
+        let k = (эw as f64 / кw as f64).max(эh as f64 / кh as f64);
+        let вид_w = (эw as f64 / k).min(кw as f64).max(1.0);
+        let вид_h = (эh as f64 / k).min(кh as f64).max(1.0);
+        vp.set_source((кw as f64 - вид_w) / 2.0, (кh as f64 - вид_h) / 2.0, вид_w, вид_h);
+        vp.set_destination(эw as i32, эh as i32);
+    }
+
+    let Some(surface) = state.bg_surface.as_ref() else { return };
+    // Кадровый callback — по нему же, что и на обычном пути, понимаем, видно ли
+    // обои вообще. Композитор молчит, пока они закрыты полноэкранным окном;
+    // главный цикл тогда перестаёт забирать кадры, декодер встаёт на `send`, и
+    // видеокарта тоже отдыхает.
+    if let Some(qh) = state.qh.as_ref() {
+        surface.frame(qh, ());
+        state.кадр_заказан = Some(сейчас);
+    }
+    свободен.store(false, Ordering::Relaxed);
+    surface.attach(Some(&буфер), 0, 0);
+    // Порча — в координатах буфера, а он размером с кадр, не с экран.
+    surface.damage_buffer(0, 0, кw as i32, кh as i32);
+    surface.commit();
+
+    // Держим поверхность занятой, пока композитор не пришлёт release.
+    state.hw_на_экране.push((свободен, кадр.держатель));
+}
+
 /// Отдать декодеру видео свободные слоты общей памяти.
 ///
 /// Он пишет кадр прямо в них (см. [`залить_кадр`]), поэтому слот можно
@@ -2464,6 +2761,18 @@ fn overlay_slot(state: &mut Config) -> Option<usize> {
 /// буфер того же размера и снимаем регион ввода, чтобы невидимое меню не
 /// съедало клики по окнам под ним.
 fn hide_overlay(state: &mut Config) -> bool {
+    // До первого ack прикреплять буфер запрещено протоколом — за это
+    // композитор убивает клиента («must ack the initial configure before
+    // attaching buffer»), и dwall уходит в цикл перезапусков.
+    //
+    // Проверка стояла только в render_overlay, а сюда ведёт вторая дорога:
+    // значок загрузки при ЗАКРЫТОМ меню (см. плашка_загрузки ниже). Пока
+    // фоновая работа при старте была только у статичных обоев, поймать это
+    // было почти нечем — картинка успевала загрузиться позже первого
+    // configure. С живыми обоями окно стало шире: у них в фоне считается кадр
+    // для плавного перехода, и спиннер зажигается в первые же миллисекунды,
+    // ещё до ответа композитора.
+    if !state.ol_configured { return false; }
     let Some(idx) = overlay_slot(state) else { return false };
     let Some(compositor) = state.compositor.clone() else { return false };
     let Some(qh) = state.qh.clone() else { return false };
@@ -3239,9 +3548,42 @@ fn start_load_wallpaper(state: &mut Config, path: String) {
     // Прошлые живые обои останавливаем сразу: Drop убьёт ffmpeg, а поток
     // gif-декодера сам выйдет, когда канал окажется закрыт.
     state.anim = None;
+    // То же для аппаратного пути. Буферы старых поверхностей уничтожаем явно:
+    // прокси wayland-client в Drop ничего не разрушает, и при каждой смене
+    // обоев на композиторе оседал бы лишний пул.
+    state.hw = None;
+    state.hw_на_экране.clear();
+    for (буфер, _) in state.hw_буферы.values() {
+        буфер.destroy();
+    }
+    state.hw_буферы.clear();
 
     // Живые форматы (видео и многокадровый gif) идут своим путём — кадрами.
     let (w, h) = state.outputs.first().map(|(_, w, h)| (*w, *h)).unwrap_or((0, 0));
+
+    // ── Видео: сперва пробуем видеокарту ────────────────────────────────────
+    // Кадр остаётся в видеопамяти от декодера до экрана, процессор не трогает
+    // ни одного пикселя (см. hwvideo.rs). Не вышло — молча уходим на путь
+    // через процесс ffmpeg ниже: обои важнее экономии.
+    if w > 0 && h > 0 && is_video(&path) && state.dmabuf.is_some() {
+        if let Some(hw) = hwvideo::запустить(&path, hwvideo::УЗЕЛ_ПО_УМОЛЧАНИЮ) {
+            state.hw = Some(hw);
+            state.hw_срок = std::time::Instant::now();
+            state.кадр_слота = None;
+            // Плавный переход играем по неподвижному первому кадру — сам
+            // аппаратный кадр смешать не с чем. Пока он считается, декодер
+            // стоит на первом же кадре и ничего не тратит.
+            let (tx, rx) = std::sync::mpsc::channel();
+            state.pending_img = Some(rx);
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(кадр_для_перехода(&p));
+            });
+            return;
+        }
+        eprintln!("dwall: видеокарта этот ролик не взяла — декодируем процессором");
+    }
+
     if w > 0 && h > 0 && (is_video(&path) || path.to_lowercase().ends_with(".gif")) {
         if let Some(anim) = start_anim(&path, w, h) {
             state.anim = Some(anim);
@@ -3679,6 +4021,42 @@ fn first_video_frame(path: &str) -> Option<(u32, u32, Vec<u8>)> {
         return None;
     }
     Some((W, H, out.stdout[..нужно].to_vec()))
+}
+
+/// Первый кадр ролика в РОДНОМ разрешении — снимок, по которому играется
+/// плавный переход на живые обои.
+///
+/// Зачем отдельно от [`first_video_frame`]: тот отдаёт миниатюру 640×360 для
+/// меню, и на экране 3840×2160 переход по ней шёл бы через заметное мыло.
+///
+/// Аппаратный декодер смешивать нечем: его кадр лежит в видеопамяти, и
+/// процессор до него не дотягивается (в этом вся суть, см. hwvideo.rs).
+/// Поэтому переход играется по этому неподвижному кадру обычным путём через
+/// общую память, а когда он доигран, эстафету незаметно принимает видеокарта —
+/// картинка та же самая, стыка не видно.
+///
+/// Цена — один запуск ffmpeg на ОДИН кадр при смене обоев. На фоне того, что
+/// раньше ffmpeg работал непрерывно все 60 кадров в секунду, это ничто.
+fn кадр_для_перехода(path: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, h) = размер_видео(path)?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-loglevel", "error", "-nostdin",
+            "-i", path, "-frames:v", "1",
+            // rgba, а не bgra: так же, как отдаёт load_image, и общий путь
+            // показа сам свопнет каналы (img_bgra = false).
+            "-f", "rawvideo", "-pix_fmt", "rgba", "-",
+        ])
+        .output()
+        .ok()?;
+    let нужно = (w as usize) * (h as usize) * 4;
+    if out.stdout.len() < нужно {
+        return None;
+    }
+    Some((w, h, out.stdout[..нужно].to_vec()))
 }
 
 fn is_image(p: &std::path::Path) -> bool {
