@@ -52,7 +52,7 @@ use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Одна плоскость кадра в dmabuf: чей файловый дескриптор, с каким сдвигом и
@@ -139,6 +139,14 @@ pub struct HwВидео {
     pub первый: Option<ГотовыйКадр>,
     /// Просьба потоку декодера закончиться (обои сменили).
     стоп: Arc<AtomicBool>,
+    /// Поверхности, описание которых уже уехало главному циклу.
+    ///
+    /// Общий с потоком декодера НАРОЧНО. Описание строится один раз на
+    /// поверхность, а `wl_buffer` под него живёт в `hw_буферы` главного цикла;
+    /// значит выбросить буфер (см. ПРЕДЕЛ_HW_БУФЕРОВ в main.rs) можно, только
+    /// если декодер об этом узнает и опишет поверхность заново. Иначе кадры с
+    /// этим номером просто перестали бы показываться.
+    pub известные: Arc<Mutex<HashSet<usize>>>,
 }
 
 impl Drop for HwВидео {
@@ -156,6 +164,12 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 
 const DRM_FORMAT_R8: u32 = fourcc(b'R', b'8', b' ', b' ');
 const DRM_FORMAT_GR88: u32 = fourcc(b'G', b'R', b'8', b'8');
+/// То же самое, что [`DRM_FORMAT_GR88`], но так плоскость цветности называет
+/// `nvidia-vaapi-driver`. Mesa зовёт её `GR88`, NVIDIA — `RG88`; байты в памяти
+/// одни и те же (16 бит на пиксель, Cb и Cr вперемешку), различие чисто в
+/// имени. Проверено 20.08.2026 на RTX 5060: без этой ветки dwall не собирал
+/// описание и уходил на ffmpeg.
+const DRM_FORMAT_RG88: u32 = fourcc(b'R', b'G', b'8', b'8');
 const DRM_FORMAT_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
 
 /// Бит «ближайший сосед» в маске флагов `sws_getContext`.
@@ -558,8 +572,20 @@ unsafe fn описать(
         let fourcc = match форматы.as_slice() {
             [ф] => *ф,
             // Разложенный по слоям NV12 — собираем обратно.
-            [DRM_FORMAT_R8, DRM_FORMAT_GR88] => DRM_FORMAT_NV12,
-            _ => return None,
+            [DRM_FORMAT_R8, DRM_FORMAT_GR88 | DRM_FORMAT_RG88] => DRM_FORMAT_NV12,
+            _ => {
+                static РАЗ: std::sync::Once = std::sync::Once::new();
+                РАЗ.call_once(|| {
+                    let имена: Vec<String> = форматы.iter()
+                        .map(|ф| String::from_utf8_lossy(&ф.to_le_bytes()).trim_end().to_string())
+                        .collect();
+                    eprintln!(
+                        "dwall: незнакомая раскладка слоёв: {:?}, объектов {}, модификатор {:#x}",
+                        имена, desc.nb_objects, модификатор,
+                    );
+                });
+                return None;
+            }
         };
 
         Some(ОписаниеПоверхности {
@@ -589,10 +615,12 @@ pub fn запустить(путь: &str, устройство: &str) -> Option<
     let (tx, rx) = sync_channel::<ГотовыйКадр>(1);
     let стоп = Arc::new(AtomicBool::new(false));
     let поток_стоп = стоп.clone();
+    let известные: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
+    let поток_известные = известные.clone();
 
     std::thread::Builder::new()
         .name("dwall-hwdec".into())
-        .spawn(move || декодировать(открытое, tx, поток_стоп, шаг))
+        .spawn(move || декодировать(открытое, tx, поток_стоп, поток_известные, шаг))
         .ok()?;
 
     // ── Дожидаемся ПЕРВОГО кадра прямо здесь ────────────────────────────────
@@ -613,7 +641,7 @@ pub fn запустить(путь: &str, устройство: &str) -> Option<
         Err(_) => return None,
     };
 
-    Some(HwВидео { rx, размер, первый, стоп })
+    Some(HwВидео { rx, размер, первый, стоп, известные })
 }
 
 /// Узел рендера по умолчанию. Отдельная карта здесь одна, и перебирать
@@ -689,12 +717,13 @@ fn декодировать(
     открытое: Открытое,
     tx: SyncSender<ГотовыйКадр>,
     стоп: Arc<AtomicBool>,
+    известные: Arc<Mutex<HashSet<usize>>>,
     шаг: Duration,
 ) {
     // Поверхности, про которые главный цикл уже знает. VAAPI гоняет по кругу
     // десяток-другой, так что после первых кадров описания перестают строиться
-    // вовсе — остаётся только номер поверхности.
-    let mut известные: HashSet<usize> = HashSet::new();
+    // вовсе — остаётся только номер поверхности. Список общий с главным циклом:
+    // он выбрасывает лишние буферы и вычёркивает их отсюда (см. HwВидео).
     // Сколько пакетов согласны скормить декодеру, не увидев ни одного кадра,
     // прежде чем признать, что он этот кодек не тянет.
     //
@@ -734,6 +763,20 @@ fn декодировать(
                 // что стоял у ffmpeg, только своими руками.
                 ff::av_seek_frame(открытое.fmt, открытое.поток, 0, ff::AVSEEK_FLAG_BACKWARD as i32);
                 ff::avcodec_flush_buffers(открытое.codec);
+                // Флаш роняет пул поверхностей VAAPI и заводит его заново —
+                // номера после него ЧУЖИЕ, а `wl_buffer`, построенные на
+                // прежних, показывают уже освобождённую видеопамять. Замер
+                // 24.08.2026: 8 новых поверхностей на каждый оборот ролика,
+                // старые не уничтожались никогда — за 36 секунд показа dawn
+                // набирал 741 дескриптор dmabuf при лимите 1024 (см.
+                // ПРЕДЕЛ_HW_БУФЕРОВ в main.rs).
+                //
+                // Список чистим, чтобы описание построилось заново на каждую
+                // поверхность: главный цикл по нему и поймёт, что буфер под
+                // этим номером устарел и его пора уничтожить.
+                if let Ok(mut с) = известные.lock() {
+                    с.clear();
+                }
                 continue;
             }
 
@@ -793,7 +836,7 @@ fn декодировать(
                 };
 
                 был_кадр = true;
-                match отдать_кадр(поверхность, &mut известные, &tx, шаг) {
+                match отдать_кадр(поверхность, &известные, &tx, шаг) {
                     Ok(()) => {}
                     // Главный цикл закрыл канал: обои сменили или dwall
                     // заканчивается.
@@ -815,7 +858,7 @@ fn декодировать(
 /// `Err(())` — канал закрыт, поток обязан закончиться.
 unsafe fn отдать_кадр(
     кадр: *mut ff::AVFrame,
-    известные: &mut HashSet<usize>,
+    известные: &Arc<Mutex<HashSet<usize>>>,
     tx: &SyncSender<ГотовыйКадр>,
     шаг: Duration,
 ) -> Result<(), ()> {
@@ -832,7 +875,16 @@ unsafe fn отдать_кадр(
             return Ok(());
         }
         (*mapped).format = ff::AVPixelFormat_AV_PIX_FMT_DRM_PRIME;
-        if ff::av_hwframe_map(mapped, кадр, ff::AV_HWFRAME_MAP_READ as i32) < 0 {
+        let код = ff::av_hwframe_map(mapped, кадр, ff::AV_HWFRAME_MAP_READ as i32);
+        if код < 0 {
+            // Молчать здесь нельзя: `был_кадр` уже выставлен, значит счётчик
+            // ЛИМИТ_БЕЗ_КАДРОВ не сработает, и отказ выглядел бы как пятисекундное
+            // молчание с одним лишь «не взялся» в конце. Ровно так выглядел отказ
+            // nvidia-vaapi-driver, и причину пришлось искать снаружи.
+            static РАЗ: std::sync::Once = std::sync::Once::new();
+            РАЗ.call_once(|| {
+                eprintln!("dwall: кадр не отобразился в dmabuf: {}", ошибка(код));
+            });
             ff::av_frame_free(&mut { mapped });
             ff::av_frame_free(&mut { кадр });
             return Ok(());
@@ -840,14 +892,19 @@ unsafe fn отдать_кадр(
 
         // Описание строим только для поверхности, которую главный цикл ещё не
         // видел, — остальные он узнает по номеру и возьмёт готовый wl_buffer.
-        let описание = if известные.insert(surface_id) {
+        let впервые = известные.lock().map(|mut с| с.insert(surface_id)).unwrap_or(true);
+        let описание = if впервые {
             match описать(mapped, surface_id, размер) {
                 Some(готово) => Some(готово),
                 None => {
                     // Формат, который мы не умеем разложить в wl_buffer.
                     // Поверхность обратно в «неизвестные»: вдруг следующая
                     // приедет нормальной.
-                    известные.remove(&surface_id);
+                    static РАЗ: std::sync::Once = std::sync::Once::new();
+                    РАЗ.call_once(|| {
+                        eprintln!("dwall: кадр отобразился, но описание dmabuf не собралось");
+                    });
+                    if let Ok(mut с) = известные.lock() { с.remove(&surface_id); }
                     ff::av_frame_free(&mut { mapped });
                     ff::av_frame_free(&mut { кадр });
                     return Ok(());
