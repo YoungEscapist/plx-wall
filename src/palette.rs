@@ -1,14 +1,14 @@
 //! Палитра из обоев.
 //!
 //! Идея всей затеи: цвет живёт в ОДНОМ месте — в 16 цветах ANSI-палитры
-//! терминала. Обои меняются → dwall пересчитывает палитру и рассылает её
+//! терминала. Обои меняются → plx-wall пересчитывает палитру и рассылает её
 //! escape-последовательностями во все живые pty. Всё, что рисует себя
 //! обычными ANSI-цветами (cmatrix, fastfetch, starship, tuimus), меняет вид
 //! само, без перезапуска и без единой строчки в их конфигах.
 //!
 //! Что получается на выходе:
-//! - `~/.cache/dwall/palette.json` — для тех, кто хочет цвета явно (tuimus);
-//! - `~/.cache/dwall/palette.sh`   — то же для шелла;
+//! - `~/.cache/plx-wall/palette.json` — для тех, кто хочет цвета явно (tuimus);
+//! - `~/.cache/plx-wall/palette.sh`   — то же для шелла;
 //! - `~/.config/ghostty/colors`    — новые окна ghostty стартуют уже в теме;
 //! - OSC 4/10/11/12 во все `/dev/pts/*` — УЖЕ ОТКРЫТЫЕ окна перекрашиваются.
 //!
@@ -409,7 +409,7 @@ impl Palette {
 // ── Запись и рассылка ───────────────────────────────────────────────────────
 
 fn кэш() -> String {
-    format!("{}/.cache/dwall", crate::home())
+    format!("{}/.cache/plx-wall", crate::home())
 }
 
 impl Palette {
@@ -430,11 +430,11 @@ impl Palette {
 
     fn shell(&self) -> String {
         let mut s = String::new();
-        s.push_str(&format!("DWALL_BG={}\n", hex(self.bg)));
-        s.push_str(&format!("DWALL_FG={}\n", hex(self.fg)));
-        s.push_str(&format!("DWALL_ACCENT={}\n", hex(self.accent)));
+        s.push_str(&format!("PLX_WALL_BG={}\n", hex(self.bg)));
+        s.push_str(&format!("PLX_WALL_FG={}\n", hex(self.fg)));
+        s.push_str(&format!("PLX_WALL_ACCENT={}\n", hex(self.accent)));
         for (i, c) in self.ansi.iter().enumerate() {
-            s.push_str(&format!("DWALL_ANSI{i}={}\n", hex(*c)));
+            s.push_str(&format!("PLX_WALL_ANSI{i}={}\n", hex(*c)));
         }
         s
     }
@@ -442,7 +442,7 @@ impl Palette {
     /// Фрагмент конфига ghostty. Подключается из основного через
     /// `config-file = ?colors` — новые окна открываются уже в теме обоев.
     fn ghostty(&self) -> String {
-        let mut s = String::from("# Создаётся dwall при смене обоев. Править нет смысла.\n");
+        let mut s = String::from("# Создаётся plx-wall при смене обоев. Править нет смысла.\n");
         s.push_str(&format!("background = {}\n", hex(self.bg)));
         s.push_str(&format!("foreground = {}\n", hex(self.fg)));
         s.push_str(&format!("cursor-color = {}\n", hex(self.cursor)));
@@ -464,7 +464,7 @@ impl Palette {
     /// неё он ругается на конфиг и откатывается к встроенной теме.
     fn fuzzel(&self) -> String {
         let mut s = String::from(
-            "# Создаётся dwall при смене обоев. Править нет смысла — перезапишется.\n\
+            "# Создаётся plx-wall при смене обоев. Править нет смысла — перезапишется.\n\
              # Раздел [colors] правится целиком; остальное fuzzel берёт из своих\n\
              # значений по умолчанию, поэтому здесь его нет.\n[colors]\n",
         );
@@ -587,7 +587,7 @@ use std::os::unix::fs::OpenOptionsExt;
 /// Посчитать палитру по обоям и разложить её по местам. Зовётся из фонового
 /// потока: декодирование картинки тут стоит столько же, сколько сами обои.
 ///
-/// Возвращает посчитанную палитру — ей пользуется режим `dwall --palette`,
+/// Возвращает посчитанную палитру — ей пользуется режим `plx-wall --palette`,
 /// чтобы показать результат, не поднимая ни композитора, ни обоев.
 pub fn apply(path: &str) -> Option<Palette> {
     // Картинку берём уменьшенной: для гистограммы хватает и 64×64, а полный
@@ -619,13 +619,13 @@ pub fn apply(path: &str) -> Option<Palette> {
     }
 
     // Приглашение zsh. Исходную тему НЕ трогаем — читаем её как основу и
-    // пишем рядом отдельный dwall.json, на который смотрит .zshrc. Так
+    // пишем рядом отдельный plx-wall.json, на который смотрит .zshrc. Так
     // авторская раскладка остаётся у пользователя в целости, а откат сводится
     // к возврату одной строчки в .zshrc.
     let omp = format!("{}/.config/oh-my-posh", crate::home());
     let основа = format!("{omp}/soft-nord.json");
     if let Ok(текст) = std::fs::read_to_string(&основа) {
-        let _ = std::fs::write(format!("{omp}/dwall.json"), p.oh_my_posh(&текст));
+        let _ = std::fs::write(format!("{omp}/plx-wall.json"), p.oh_my_posh(&текст));
     }
 
     разослать(&p.osc());
@@ -635,13 +635,13 @@ pub fn apply(path: &str) -> Option<Palette> {
 
 /// Перерисовать темы приложений, которые не умеют палитру терминала
 /// (Vesktop, Waterfox, AyuGram) — этим занимается отдельный сценарий
-/// `~/.local/bin/dwall-themes`.
+/// `~/.local/bin/plx-wall-themes`.
 ///
 /// Запускаем и НЕ ЖДЁМ: внутри там ffmpeg (кадр обоев для фона Telegram), это
 /// секунды. Ждать их в потоке палитры незачем — обои от этого не зависят.
-/// Нет сценария — молча идём дальше: dwall обязан работать и без него.
+/// Нет сценария — молча идём дальше: plx-wall обязан работать и без него.
 fn обновить_темы() {
-    let путь = format!("{}/.local/bin/dwall-themes", crate::home());
+    let путь = format!("{}/.local/bin/plx-wall-themes", crate::home());
     if !std::path::Path::new(&путь).is_file() {
         return;
     }
@@ -658,18 +658,18 @@ fn обновить_темы() {
     }
 }
 
-/// `dwall --palette [файл]` — пересчитать палитру и показать её.
+/// `plx-wall --palette [файл]` — пересчитать палитру и показать её.
 ///
 /// Без файла берутся обои, показанные сейчас. Нужен и для проверки (палитра
 /// считается без композитора), и по-человечески: перекрасить терминалы, не
 /// трогая обои.
 pub fn режим_палитры(файл: Option<String>) -> i32 {
     let Some(path) = файл.or_else(crate::load_current) else {
-        eprintln!("dwall --palette: не задан файл и нет запомненных обоев");
+        eprintln!("plx-wall --palette: не задан файл и нет запомненных обоев");
         return 1;
     };
     let Some(p) = apply(&path) else {
-        eprintln!("dwall --palette: не удалось разобрать {path}");
+        eprintln!("plx-wall --palette: не удалось разобрать {path}");
         return 1;
     };
     println!("обои:  {path}");

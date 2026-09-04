@@ -293,23 +293,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "dwall"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "fontdue",
- "gif 0.13.3",
- "image",
- "libc",
- "pkg-config",
- "serde",
- "serde_json",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
-]
-
-[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -795,6 +778,23 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "plx-wall"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "fontdue",
+ "gif 0.13.3",
+ "image",
+ "libc",
+ "pkg-config",
+ "serde",
+ "serde_json",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+]
 
 [[package]]
 name = "png"

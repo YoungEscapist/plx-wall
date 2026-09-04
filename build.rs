@@ -20,12 +20,12 @@ fn main() {
     for lib in ["libavcodec", "libavformat", "libavutil", "libswscale"] {
         let found = pkg_config::Config::new()
             .probe(lib)
-            .unwrap_or_else(|e| panic!("dwall: не найден {lib}: {e}"));
+            .unwrap_or_else(|e| panic!("plx-wall: не найден {lib}: {e}"));
         for p in &found.include_paths {
             include_args.push(format!("-I{}", p.display()));
         }
         // На NixOS у собранного cargo бинаря пустой RUNPATH, а /usr/lib не
-        // существует вовсе: без явного rpath dwall упал бы при запуске на
+        // существует вовсе: без явного rpath plx-wall упал бы при запуске на
         // «libavcodec.so.63: cannot open shared object file». Прописываем
         // абсолютный путь стора — он же тот, с которым мы слинковались.
         //
@@ -99,12 +99,12 @@ fn main() {
         .derive_default(false)
         .layout_tests(false)
         .generate()
-        .expect("dwall: bindgen не смог разобрать заголовки ffmpeg");
+        .expect("plx-wall: bindgen не смог разобрать заголовки ffmpeg");
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     bindings
         .write_to_file(out.join("ffmpeg.rs"))
-        .expect("dwall: не записались привязки ffmpeg");
+        .expect("plx-wall: не записались привязки ffmpeg");
 
     println!("cargo:rerun-if-changed=build.rs");
 }
