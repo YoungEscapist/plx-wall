@@ -359,10 +359,13 @@ impl Palette {
     pub fn from_pixels(px: &[u8]) -> Palette {
         let (тон, s, _l) = главный_тон(px);
 
-        // Фон — тёмный, но не чёрный: в нём должен читаться тон обоев,
-        // иначе смысл всей затеи теряется. Насыщенность держим низкой, чтобы
-        // текст поверх не резал глаз.
-        let bg = hsl2rgb(тон, (s * 0.55).clamp(0.10, 0.30), 0.075);
+        // Фон — приглушённый тон обоев, а не почти-чёрный. Было 0.075: окна
+        // выглядели дырами в экране. В референсе, под который это
+        // подбиралось (17.09.2026, сиреневые дотфайлы), фон окна около 0.3 по
+        // яркости; 0.17 плюс экранный шейдер haze.frag (он поднимает тени ещё)
+        // дают то же, а текст (0.86) остаётся контрастным. Насыщенность
+        // низкая, чтобы текст поверх не резал глаз.
+        let bg = hsl2rgb(тон, (s * 0.55).clamp(0.12, 0.30), 0.17);
         let fg = hsl2rgb(тон, (s * 0.25).clamp(0.05, 0.18), 0.86);
         let accent = hsl2rgb(тон, s.max(0.45), 0.58);
         let cursor = hsl2rgb(тон, s.max(0.40), 0.66);
@@ -383,9 +386,10 @@ impl Palette {
 
         // 0 — «чёрный». Не чистый ноль: cmatrix и компания красят им фон, и на
         // угольном тоне обоев это выглядит куском темноты, а не дырой.
-        ansi[0] = hsl2rgb(тон, (s * 0.5).clamp(0.08, 0.25), 0.13);
+        // Светлее фона (0.17): иначе «чёрные» плашки вышли бы темнее окна.
+        ansi[0] = hsl2rgb(тон, (s * 0.5).clamp(0.08, 0.25), 0.22);
         ansi[7] = hsl2rgb(тон, (s * 0.2).clamp(0.04, 0.15), 0.78);
-        ansi[8] = hsl2rgb(тон, (s * 0.4).clamp(0.06, 0.22), 0.32);
+        ansi[8] = hsl2rgb(тон, (s * 0.4).clamp(0.06, 0.22), 0.40);
         ansi[15] = hsl2rgb(тон, (s * 0.12).clamp(0.02, 0.10), 0.95);
 
         // Якорь — «красный». Он и садится на тон обоев, остальные раскладываются
@@ -454,29 +458,31 @@ impl Palette {
         s
     }
 
-    /// Тема лаунчера приложений (fuzzel).
+    /// Цвета лаунчера приложений (rofi) — `~/.config/rofi/colors.rasi`.
     ///
-    /// fuzzel читает конфиг при КАЖДОМ запуске и живёт ровно одно нажатие,
+    /// rofi читает тему при КАЖДОМ запуске и живёт ровно одно нажатие,
     /// поэтому перекрашивать уже открытое окно, как с терминалами через OSC,
     /// не нужно: следующий вызов и так стартует в новых цветах.
     ///
-    /// Цвета здесь в формате RRGGBBAA — fuzzel требует альфу обязательно, без
-    /// неё он ругается на конфиг и откатывается к встроенной теме.
-    fn fuzzel(&self) -> String {
+    /// Здесь только переменные; раскладку держит `config.rasi`, который их
+    /// импортирует. Подсветка совпадений — исключение: в `highlight` rofi
+    /// переменные не подставляет, поэтому цвет пишется туда литералом.
+    fn rofi(&self) -> String {
+        let fg = hex(self.fg);
         let mut s = String::from(
-            "# Создаётся plx-wall при смене обоев. Править нет смысла — перезапишется.\n\
-             # Раздел [colors] правится целиком; остальное fuzzel берёт из своих\n\
-             # значений по умолчанию, поэтому здесь его нет.\n[colors]\n",
+            "/* Создаётся plx-wall при смене обоев. Править нет смысла — перезапишется. */\n* {\n",
         );
         // Фон чуть плотнее терминального: лаунчер висит поверх обоев, и на
         // пёстрой картинке полупрозрачный фон делал список нечитаемым.
-        s.push_str(&format!("background={}f2\n", hex(self.bg).trim_start_matches('#')));
-        s.push_str(&format!("text={}ff\n", hex(self.fg).trim_start_matches('#')));
-        s.push_str(&format!("match={}ff\n", hex(self.accent).trim_start_matches('#')));
-        s.push_str(&format!("selection={}ff\n", hex(self.sel_bg).trim_start_matches('#')));
-        s.push_str(&format!("selection-text={}ff\n", hex(self.ansi[15]).trim_start_matches('#')));
-        s.push_str(&format!("selection-match={}ff\n", hex(self.accent).trim_start_matches('#')));
-        s.push_str(&format!("border={}ff\n", hex(self.accent).trim_start_matches('#')));
+        s.push_str(&format!("    bg:     {}e6;\n", hex(self.bg)));
+        s.push_str(&format!("    bg-alt: {fg}14;\n"));
+        s.push_str(&format!("    fg:     {fg}ff;\n"));
+        s.push_str(&format!("    fg-dim: {fg}8c;\n"));
+        s.push_str(&format!("    accent: {}ff;\n", hex(self.accent)));
+        s.push_str(&format!("    sel:    {}ff;\n", hex(self.sel_bg)));
+        s.push_str(&format!("    sel-fg: {}ff;\n", hex(self.ansi[15])));
+        s.push_str("}\n");
+        s.push_str(&format!("element-text {{ highlight: bold {}; }}\n", hex(self.accent)));
         s
     }
 
@@ -605,17 +611,26 @@ pub fn apply(path: &str) -> Option<Palette> {
 
     let g = format!("{}/.config/ghostty", crate::home());
     if std::path::Path::new(&g).is_dir() {
-        let _ = std::fs::write(format!("{g}/colors"), p.ghostty());
+        // Через .tmp + rename: ghostty перечитывает файл сразу (см. ниже) и
+        // иначе мог бы застать его обрезанным посреди записи.
+        let tmp = format!("{g}/colors.tmp");
+        if std::fs::write(&tmp, p.ghostty()).is_ok() {
+            let _ = std::fs::rename(&tmp, format!("{g}/colors"));
+        }
+        // ghostty — один процесс на все окна, и конфиг он читает при старте.
+        // OSC выше перекрашивает только уже открытые окна, а новые брали цвета
+        // из конфига в памяти — то есть от первых обоев сессии. SIGUSR2 велит
+        // ghostty (≥ 1.2) перечитать конфиг вместе с файлом `colors`.
+        будить_ghostty();
     }
 
-    // Лаунчер приложений. Каталог создаём сами, в отличие от ghostty: у fuzzel
-    // конфига может не быть вовсе (он прекрасно работает на умолчаниях), и
-    // ждать, пока пользователь заведёт его руками, значило бы никогда не
-    // покрасить лаунчер. Пишем только [colors] — остальные настройки остаются
-    // за fuzzel, и его умолчания мы не трогаем.
-    let f = format!("{}/.config/fuzzel", crate::home());
+    // Лаунчер приложений. Каталог создаём сами, в отличие от ghostty: темы
+    // rofi может не быть вовсе, и ждать, пока пользователь заведёт её руками,
+    // значило бы никогда не покрасить лаунчер. Пишем только colors.rasi —
+    // config.rasi с раскладкой остаётся за пользователем.
+    let f = format!("{}/.config/rofi", crate::home());
     if std::fs::create_dir_all(&f).is_ok() {
-        let _ = std::fs::write(format!("{f}/fuzzel.ini"), p.fuzzel());
+        let _ = std::fs::write(format!("{f}/colors.rasi"), p.rofi());
     }
 
     // Приглашение zsh. Исходную тему НЕ трогаем — читаем её как основу и
@@ -631,6 +646,21 @@ pub fn apply(path: &str) -> Option<Palette> {
     разослать(&p.osc());
     обновить_темы();
     Some(p)
+}
+
+/// SIGUSR2 всем своим процессам ghostty — «перечитай конфиг». Ищем по
+/// `/proc/*/comm`, чужие процессы отсекает сам `kill` (EPERM).
+fn будить_ghostty() {
+    let Ok(каталог) = std::fs::read_dir("/proc") else { return };
+    for запись in каталог.flatten() {
+        let Some(pid) = запись.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let имя = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if имя.trim_end() == "ghostty" {
+            unsafe { libc::kill(pid, libc::SIGUSR2) };
+        }
+    }
 }
 
 /// Перерисовать темы приложений, которые не умеют палитру терминала
