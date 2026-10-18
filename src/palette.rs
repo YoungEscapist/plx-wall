@@ -561,10 +561,26 @@ impl Palette {
             s.push_str(&format!("\x1b]4;{i};{}\x1b\\", hex(*c)));
         }
         s.push_str(&format!("\x1b]10;{}\x1b\\", hex(self.fg)));
-        s.push_str(&format!("\x1b]11;{}\x1b\\", hex(self.bg)));
+        // Свой ровный фон терминала (`~/.config/ghostty/solid`, строка
+        // `background = #rrggbb`) главнее фона из обоев: иначе смена обоев
+        // перекрашивала бы на лету фон, который человек нарочно закрепил.
+        let фон = закреплённый_фон().unwrap_or_else(|| hex(self.bg));
+        s.push_str(&format!("\x1b]11;{фон}\x1b\\"));
         s.push_str(&format!("\x1b]12;{}\x1b\\", hex(self.cursor)));
         s
     }
+}
+
+/// Закреплённый фон терминала: `background = #rrggbb` из
+/// `~/.config/ghostty/solid` (его читает ghostty после нашего `colors`).
+fn закреплённый_фон() -> Option<String> {
+    let дом = std::env::var("HOME").ok()?;
+    let текст = std::fs::read_to_string(format!("{дом}/.config/ghostty/solid")).ok()?;
+    текст.lines().find_map(|l| {
+        let (ключ, знач) = l.split_once('=')?;
+        let знач = знач.trim();
+        (ключ.trim() == "background" && знач.len() == 7 && знач.starts_with('#')).then(|| знач.to_string())
+    })
 }
 
 /// Разослать палитру во все псевдотерминалы пользователя.
