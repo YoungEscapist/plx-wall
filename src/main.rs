@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 mod configs;
 mod ffmpeg_sys;
+mod gbm;
 mod hwvideo;
 mod online;
 mod palette;
@@ -624,12 +625,17 @@ struct ShmSlot {
     /// память через `splice`, а `splice` умеет писать только в файловый
     /// дескриптор (см. [`Заём`]).
     fd: OwnedFd,
+    /// Слот в буфере GBM (см. src/gbm.rs): `ptr` смотрит в его отображение,
+    /// и снимает отображение он сам, когда его отпустит и декодер.
+    gbm: Option<std::sync::Arc<gbm::Отображение>>,
 }
 
 impl Drop for ShmSlot {
     fn drop(&mut self) {
         self.buffer.destroy();
-        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len); }
+        if self.gbm.is_none() {
+            unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len); }
+        }
     }
 }
 
@@ -656,7 +662,44 @@ fn make_slots(
             0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888, qh, занят.clone(),
         );
         pool.destroy(); // отображение держит сам буфер
-        out.push(ShmSlot { buffer, ptr: ptr as *mut u8, len: size, занят, fd: owned });
+        out.push(ShmSlot { buffer, ptr: ptr as *mut u8, len: size, занят, fd: owned, gbm: None });
+    }
+    Some(out)
+}
+
+/// Те же два слота, но в линейных буферах GBM, отданных композитору как
+/// dmabuf: тогда он не заливает каждый кадр ролика в текстуру сам (см.
+/// src/gbm.rs, там и замер). `None` — не вышло, звавший берёт [`make_slots`].
+fn make_gbm_slots(state: &Config, w: u32, h: u32) -> Option<Vec<ShmSlot>> {
+    let dmabuf = state.dmabuf.as_ref()?;
+    let qh = state.qh.as_ref()?;
+    if !state.dmabuf_форматы.contains(&(gbm::ARGB8888, gbm::ЛИНЕЙНЫЙ)) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let отображение = gbm::буфер(w, h)?;
+        let fd = отображение.fd.try_clone().ok()?;
+        let params = dmabuf.create_params(qh, ());
+        params.add(отображение.fd.as_fd(), 0, отображение.сдвиг, отображение.шаг, 0, 0);
+        let занят: Занятость = std::sync::Arc::new(AtomicUsize::new(0));
+        let buffer = params.create_immed(
+            w as i32,
+            h as i32,
+            gbm::ARGB8888,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            qh,
+            занят.clone(),
+        );
+        params.destroy();
+        out.push(ShmSlot {
+            buffer,
+            ptr: отображение.ptr,
+            len: отображение.len,
+            занят,
+            fd,
+            gbm: Some(отображение),
+        });
     }
     Some(out)
 }
@@ -700,6 +743,9 @@ enum Кадр {
 struct Заём {
     индекс: usize,
     fd: OwnedFd,
+    /// Слот в буфере GBM: заливать не `splice` в `fd`, а чтением в это
+    /// отображение (см. src/gbm.rs).
+    отображение: Option<std::sync::Arc<gbm::Отображение>>,
 }
 
 /// Проигрыватель живых обоев.
@@ -1133,12 +1179,18 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
     let (tx, rx) = sync_channel::<Кадр>(1);
 
     if is_video(path) {
+        // Режим cycle: плитка — это ВЕСЬ кадр ролика в его родном размере, как
+        // `tile` у driftwm (композитор повторяет его по холсту сам). Ни
+        // ужатой копии, ни масштаба с обрезкой под пропорцию экрана здесь
+        // быть не должно: подрезанная бесшовная текстура перестаёт быть
+        // бесшовной, и на стыке плиток появляется шов (19.10.2026).
+        let цикл = load_cycle();
         // Ужатая под этот экран копия ролика, если она уже посчитана (см.
         // `ужатая_копия`): её размер ровно экранный, и ужимать каждый кадр
         // фильтром ffmpeg не придётся вовсе — это вдвое меньше CPU на обои.
         // Копии ещё нет — крутим исходник, как раньше; копия считается фоном и
         // подхватится следующим запуском.
-        let ужатая = ужатая_копия(path, w, h);
+        let ужатая = if цикл { None } else { ужатая_копия(path, w, h) };
         let path: &str = ужатая.as_deref().unwrap_or(path);
 
         // Канал слотов: главный цикл кладёт сюда свободную общую память,
@@ -1177,6 +1229,7 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
         // Цена — качество растягивания: blit_scaled берёт ближайшего соседа,
         // ffmpeg брал бикубик. Ролик мельче экрана станет заметно грубее.
         let (вых_w, вых_h, цель) = match размер_видео(path) {
+            Some((iw, ih)) if iw > 0 && ih > 0 && цикл => (iw, ih, None),
             Some((iw, ih)) if iw > 0 && ih > 0
                 && (w as f64 / iw as f64).max(h as f64 / ih as f64) >= 1.0 =>
             {
@@ -1217,7 +1270,11 @@ fn start_anim(path: &str, w: u32, h: u32) -> Option<Anim> {
                     // здесь, труба ffmpeg переполняется, и он засыпает сам.
                     // Ошибка = главный цикл выбросил Anim, уходим.
                     let Ok(заём) = взять_слот.recv() else { return };
-                    if !залить_кадр(&out, &заём, кадр) {
+                    let залито = match заём.отображение.as_ref() {
+                        Some(отображение) => отображение.залить(&out, кадр),
+                        None => залить_кадр(&out, &заём, кадр),
+                    };
+                    if !залито {
                         break; // ffmpeg закончился или его убили
                     }
                     кадров += 1;
@@ -3201,6 +3258,14 @@ fn нажатие_в_меню(state: &mut Config, cx: u32, cy: u32, правая
             state.цикл = !state.цикл;
             save_cycle(state.цикл);
             сообщить_цикл(state.цикл);
+            // Ролик через ffmpeg кадрируется по-разному в двух режимах (см.
+            // `start_anim`), значит декодер надо поднять заново. Слоты,
+            // одолженные старому, возвращаем, как и при смене обоев.
+            if state.anim.is_some() {
+                state.anim = None;
+                state.слоты_у_декодера.iter_mut().for_each(|з| *з = false);
+                перезапустить_живые(state);
+            }
             state.dirty = true;
         }
         Some(UiAction::ВзятьИзСети(idx)) => взять_из_сети(state, idx),
@@ -4106,9 +4171,15 @@ fn одолжить_слоты(state: &mut Config) {
         return;
     }
     if state.bg_dims != (dw, dh) || state.bg_slots.len() < 2 {
-        let (Some(shm), Some(qh)) = (state.shm.as_ref(), state.qh.as_ref()) else { return };
-        let Some(slots) = make_slots(shm, qh, dw, dh) else { return };
-        state.bg_slots = slots;
+        let слоты = match make_gbm_slots(state, dw, dh) {
+            Some(слоты) => слоты,
+            None => {
+                let (Some(shm), Some(qh)) = (state.shm.as_ref(), state.qh.as_ref()) else { return };
+                let Some(слоты) = make_slots(shm, qh, dw, dh) else { return };
+                слоты
+            }
+        };
+        state.bg_slots = слоты;
         state.bg_dims = (dw, dh);
         state.bg_slot = 0;
         state.кадр_слота = None;
@@ -4134,7 +4205,8 @@ fn одолжить_слоты(state: &mut Config) {
         }
         let Ok(fd) = state.bg_slots[i].fd.try_clone() else { continue };
         let Some(anim) = state.anim.as_ref() else { return };
-        if anim.слоты.send(Заём { индекс: i, fd }).is_ok() {
+        let отображение = state.bg_slots[i].gbm.clone();
+        if anim.слоты.send(Заём { индекс: i, fd, отображение }).is_ok() {
             state.слоты_у_декодера[i] = true;
         }
     }
