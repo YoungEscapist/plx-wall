@@ -619,11 +619,17 @@ use std::os::unix::fs::OpenOptionsExt;
 /// Возвращает посчитанную палитру — ей пользуется режим `plx-wall --palette`,
 /// чтобы показать результат, не поднимая ни композитора, ни обоев.
 pub fn apply(path: &str) -> Option<Palette> {
+    let (w, h, px) = crate::load_image(path)?;
+    apply_px(w, h, &px)
+}
+
+/// То же по уже декодированной картинке (RGBA). Big picture считает палитру по
+/// обзору: второй раз декодировать гигапиксельный исходник ради 64×64 незачем.
+pub fn apply_px(w: u32, h: u32, px: &[u8]) -> Option<Palette> {
     // Картинку берём уменьшенной: для гистограммы хватает и 64×64, а полный
     // 4K-кадр считался бы десятки миллисекунд впустую.
-    let (w, h, px) = crate::load_image(path)?;
     if w == 0 || h == 0 { return None; }
-    let мелкая = crate::resize_ex(w, h, &px, 64, 64, true);
+    let мелкая = crate::resize_ex(w, h, px, 64, 64, true);
 
     let p = Palette::from_pixels(&мелкая);
 
