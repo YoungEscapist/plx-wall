@@ -9,6 +9,12 @@
 //! [`ПЕРЕД_ПРИМЕНЕНИЕМ`]: случайный щелчок по чужому снимку не стирает свой
 //! райс безвозвратно.
 //!
+//! `config.lua` при этом не кладётся как есть: вид берётся из снимка, а
+//! бинды, аккорды мыши, жесты и правила окон остаются нынешними
+//! ([`crate::keep_binds`]) — иначе старый снимок откатывал и то, что к райсу
+//! не относится (26.10 так пропали okno на Super+S и правило Waydroid).
+//! Откат «до применения» возвращает файл побайтно.
+//!
 //! Хранится в `~/.local/share/plx-wall/configs/<id>/`, файлы лежат там под
 //! своими путями относительно дома, рядом `name` — подпись в меню.
 
@@ -32,6 +38,9 @@ pub const КАТАЛОГИ: &[&str] = &[".config/parallax/shaders"];
 
 /// Снимок, который сам кладётся перед применением чужого.
 pub const ПЕРЕД_ПРИМЕНЕНИЕМ: &str = "before-apply";
+
+/// Конфиг композитора: его бинды при применении остаются нынешними.
+const КОНФИГ: &str = ".config/parallax/config.lua";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Снимок {
@@ -119,10 +128,20 @@ pub fn сохранить(дом: &Path) -> io::Result<Снимок> {
     сохранить_как(дом, &id, &имя)
 }
 
+/// Что сделало [`применить`].
+#[derive(Debug, PartialEq)]
+pub struct Применено {
+    /// Обои снимка — их ставит вызывающий.
+    pub обои: Option<String>,
+    /// `Some(true)` — config.lua слит, бинды остались нынешние; `Some(false)` —
+    /// Lua не разобрался, файл положен целиком; `None` — config.lua в снимке
+    /// нет, нынешнего нет или это откат «до применения» (побайтно).
+    pub бинды_нынешние: Option<bool>,
+}
+
 /// Вернуть файлы снимка на место. Нынешнее состояние уходит в
-/// [`ПЕРЕД_ПРИМЕНЕНИЕМ`] (кроме случая, когда применяют его же). Возвращает
-/// обои снимка — их ставит вызывающий.
-pub fn применить(дом: &Path, id: &str) -> io::Result<Option<String>> {
+/// [`ПЕРЕД_ПРИМЕНЕНИЕМ`] (кроме случая, когда применяют его же).
+pub fn применить(дом: &Path, id: &str) -> io::Result<Применено> {
     let files = каталог(дом).join(id).join("files");
     if !files.is_dir() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no such snapshot"));
@@ -130,6 +149,7 @@ pub fn применить(дом: &Path, id: &str) -> io::Result<Option<String>>
     if id != ПЕРЕД_ПРИМЕНЕНИЕМ {
         сохранить_как(дом, ПЕРЕД_ПРИМЕНЕНИЕМ, "before last apply")?;
     }
+    let mut бинды_нынешние = None;
     for f in файлы_снимка(&files) {
         let куда = дом.join(&f);
         if let Some(d) = куда.parent() {
@@ -139,10 +159,30 @@ pub fn применить(дом: &Path, id: &str) -> io::Result<Option<String>>
         // файлы когда хотят, и полузаписанный config.lua уронил бы весь
         // конфиг до встроенного.
         let врем = куда.with_extension("plx-wall-tmp");
-        std::fs::copy(files.join(&f), &врем)?;
+        let нынешний = (f == КОНФИГ && id != ПЕРЕД_ПРИМЕНЕНИЕМ)
+            .then(|| std::fs::read_to_string(&куда).ok())
+            .flatten();
+        match нынешний {
+            Some(нынешний) => {
+                let снимок = std::fs::read_to_string(files.join(&f))?;
+                match crate::keep_binds::слить(&снимок, &нынешний) {
+                    Some(слитый) => {
+                        std::fs::write(&врем, слитый)?;
+                        бинды_нынешние = Some(true);
+                    }
+                    None => {
+                        std::fs::write(&врем, снимок)?;
+                        бинды_нынешние = Some(false);
+                    }
+                }
+            }
+            None => {
+                std::fs::copy(files.join(&f), &врем)?;
+            }
+        }
         std::fs::rename(&врем, &куда)?;
     }
-    Ok(прочитать(дом, id).and_then(|с| с.обои))
+    Ok(Применено { обои: прочитать(дом, id).and_then(|с| с.обои), бинды_нынешние })
 }
 
 pub fn удалить(дом: &Path, id: &str) -> io::Result<()> {
@@ -235,8 +275,9 @@ mod tests {
 
         std::fs::write(д.join(".config/parallax/config.lua"), "set{ dissolve = 8 }").unwrap();
         std::fs::remove_file(д.join(".config/parallax/shaders/haze.frag")).unwrap();
-        let обои = применить(&д, "2026-10-18_12-00-00").unwrap();
-        assert_eq!(обои.as_deref(), Some("/w/a.png"));
+        let п = применить(&д, "2026-10-18_12-00-00").unwrap();
+        assert_eq!(п.обои.as_deref(), Some("/w/a.png"));
+        assert_eq!(п.бинды_нынешние, Some(true));
         assert_eq!(
             std::fs::read_to_string(д.join(".config/parallax/config.lua")).unwrap(),
             "set{ dissolve = 0 }"
@@ -254,6 +295,38 @@ mod tests {
         удалить(&д, "2026-10-18_12-00-00").unwrap();
         assert_eq!(список(&д).len(), 1);
         assert!(удалить(&д, "../x").is_err());
+        let _ = std::fs::remove_dir_all(&д);
+    }
+
+    #[test]
+    fn бинды_остаются_нынешними() {
+        let д = дом();
+        let конфиг = д.join(КОНФИГ);
+        std::fs::write(&конфиг, "set{ gaps = 8 }\nbind{ key = \"s\", cmd = \"rofi\" }\n").unwrap();
+        сохранить_как(&д, "старый", "старый").unwrap();
+
+        let нынешний = "set{ gaps = 12 }\nbind{ key = \"s\", cmd = \"okno\" }\nwindow{ app_id = \"okno\" }\n";
+        std::fs::write(&конфиг, нынешний).unwrap();
+        let п = применить(&д, "старый").unwrap();
+        assert_eq!(п.бинды_нынешние, Some(true));
+        assert_eq!(
+            std::fs::read_to_string(&конфиг).unwrap(),
+            "set{ gaps = 8 }\nbind{ key = \"s\", cmd = \"okno\" }\nwindow{ app_id = \"okno\" }\n"
+        );
+
+        // откат возвращает нынешний побайтно
+        let п = применить(&д, ПЕРЕД_ПРИМЕНЕНИЕМ).unwrap();
+        assert_eq!(п.бинды_нынешние, None);
+        assert_eq!(std::fs::read_to_string(&конфиг).unwrap(), нынешний);
+
+        // Lua не разобрался — снимок целиком, как раньше
+        std::fs::write(&конфиг, "bind{ key = \"x\"\n").unwrap();
+        let п = применить(&д, "старый").unwrap();
+        assert_eq!(п.бинды_нынешние, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&конфиг).unwrap(),
+            "set{ gaps = 8 }\nbind{ key = \"s\", cmd = \"rofi\" }\n"
+        );
         let _ = std::fs::remove_dir_all(&д);
     }
 

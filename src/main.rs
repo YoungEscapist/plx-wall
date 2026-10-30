@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 mod big;
 mod configs;
+mod keep_binds;
 mod ffmpeg_sys;
 mod gbm;
 mod hwvideo;
@@ -6337,7 +6338,7 @@ fn сохранить_снимок(state: &mut Config) {
 fn применить_снимок(state: &mut Config, i: usize) {
     let Some(с) = state.снимки.get(i).cloned() else { return };
     match configs::применить(std::path::Path::new(&home()), &с.id) {
-        Ok(обои) => {
+        Ok(configs::Применено { обои, бинды_нынешние }) => {
             // Раскладку снимок принёс файлом галочек — берём её ДО обоев:
             // big picture ставит картинку иначе, чем остальные режимы.
             let (цикл, большие) = (load_cycle(), load_big());
@@ -6355,7 +6356,11 @@ fn применить_снимок(state: &mut Config, i: usize) {
             // Композитор перечитывает config.lua сам по этой команде — как по
             // Super+Shift+C. Терминал и mako возьмут своё при следующем запуске.
             сказать_композитору("action reload_config".into());
-            state.снимки_итог = format!("Применено: {}", с.имя);
+            state.снимки_итог = match бинды_нынешние {
+                Some(true) => format!("Применено: {} — бинды и правила окон остались нынешние", с.имя),
+                Some(false) => format!("Применено: {} — config.lua целиком: Lua не разобрался", с.имя),
+                None => format!("Применено: {}", с.имя),
+            };
         }
         Err(e) => state.снимки_итог = format!("Не применилось: {e}"),
     }
